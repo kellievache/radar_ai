@@ -1202,6 +1202,9 @@ def main():
     if args.static_dem:    cfg.static_dem_path  = args.static_dem
     if args.static_mask:   cfg.static_mask_path = args.static_mask
 
+    if args.out_path:      cfg.out_path  = args.output
+    if args.ckpt:          cfg.ckpt      = args.ckpt
+
     if args.mode == "train":
         assert cfg.prism_train_paths and cfg.prism_val_paths, "Provide --train_paths and --val_paths"
         train(cfg)
@@ -1249,3 +1252,27 @@ if __name__ == "__main__":
 #              '--ckpt /nfs/pancake/u5/projects/vachek/automate_qc/runs/convective_correction/best.pt '
 #              '--pre_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2015.nc '
 #              '--out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/')
+
+#runfile(
+#    '/nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py',
+#    args="""--mode train
+#            --train_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_ppt_800_2023.nc
+#            --val_paths   /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_ppt_800_2024.nc
+#            --x_train_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2023.nc
+#            --x_val_paths   /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2024.nc
+#            --out_path     /nfs/pancake/u5/projects/vachek/radar_ai/models/
+#            --ckpt         model_2015_2019.pt
+#            --x_var ppt"""
+
+
+
+
+
+
+
+
+
+
+
+
+
