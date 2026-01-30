@@ -210,7 +210,7 @@ TASKS = [
         root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
         years=(2015, 2019),
         var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/automate_qc/netcdf/phase2/y_train.nc",
+        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc",
         include_text="adj_best_ppt",
     ),
     # y val paths (with radar)
@@ -218,7 +218,7 @@ TASKS = [
         root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
         years=(2023,),
         var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/automate_qc/netcdf/phase2/y_val.nc",
+        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc",
         include_text="adj_best_ppt",
     ),
     # x train paths (NO radar)
@@ -226,7 +226,7 @@ TASKS = [
         root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
         years=(2015, 2019),
         var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/automate_qc/netcdf/phase2/x_train.nc",
+        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.nc",
         include_text="cai_ppt",
     ),
     # x val paths (NO radar)
@@ -234,7 +234,7 @@ TASKS = [
         root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
         years=(2023,),
         var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/automate_qc/netcdf/phase2/x_val.nc",
+        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc",
         include_text="cai_ppt",
     ),
     # FOR INFERENCE ONLY: pre paths (NO radar; different year)
@@ -242,7 +242,7 @@ TASKS = [
         root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
         years=(2024,),
         var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/automate_qc/netcdf/phase2/infer.nc",
+        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc",
         include_text="cai_ppt",
     ),
 ]
