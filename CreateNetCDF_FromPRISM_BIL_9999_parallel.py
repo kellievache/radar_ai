@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 import xarray as xr
+import re
 
 
 from multiprocessing import Pool, cpu_count
@@ -83,14 +84,20 @@ def stack_to_netcdf(root_dir,
     Read PRISM BIL rasters for given years and write a NetCDF with a time dimension.
     Nodata is written as the sentinel (-9999) and encoded as _FillValue=-9999.
     """
+    print(f"Reading directory {root_dir}.  Looking for {include_text} in bil files there, only for {years}\n")
     # Get all candidate bil files for the years
     all_files = find_bil_files(root_dir, years=years)
 
     # Keep only .bil files that include 'adj_best' in their basename
+    # Pattern: match 8 digits (\d{8}) followed by .bil at the end ($)
+    # re.IGNORECASE makes it work for .bil, .BIL, etc.
+    pattern = re.compile(r"\d{8}\.bil$", re.IGNORECASE)
     files = [
         f for f in all_files
        # if f.lower().endswith('.bil') and include_text in os.path.basename(f).lower()
-        if f.lower().endswith('.bil') and os.path.basename(f).lower().startswith(include_text.lower())
+        if f.lower().endswith('.bil') and 
+            os.path.basename(f).lower().startswith(include_text.lower()) and
+            pattern.search(os.path.basename(f))
     ]
 
     if not files:
@@ -205,14 +212,7 @@ def stack_to_netcdf(root_dir,
 
 
 TASKS = [
-    # y train paths (with radar)
-    dict(
-        root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
-        years=(2015, 2019),
-        var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc",
-        include_text="adj_best_ppt",
-    ),
+
     # y val paths (with radar)
     dict(
         root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
@@ -221,6 +221,14 @@ TASKS = [
         out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc",
         include_text="adj_best_ppt",
     ),
+    # y train paths (with radar)
+    dict(
+        root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
+        years=(2015, 2019),
+        var_name="ppt",
+        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc",
+        include_text="adj_best_ppt",
+    ),    
     # x train paths (NO radar)
     dict(
         root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
@@ -264,7 +272,7 @@ def _run_stack_task(task: dict):
 
     try:
         _ensure_parent_dir(out_path)
-        print(f"[stack_to_netcdf] BEGIN  root={root}  years={years}  var={var_name}  out={out_path}  include='{include_txt}'")
+        print(f"[stack_to_netcdf] BEGIN  root={root}  years={years}  var={var_name}  out={out_path}  include='{include_txt}'\n")
         stack_to_netcdf(
             root,
             years=years,

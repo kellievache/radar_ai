@@ -20,7 +20,7 @@ import random
 import argparse
 import warnings
 from dataclasses import dataclass, asdict, fields
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import torch
@@ -39,6 +39,16 @@ try:
 except ImportError:
     tqdm = lambda x, **k: x
 
+
+# dataset_random_patches.py
+
+
+from torch.utils.data import Dataset
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+
+
+
 # Silence noisy "Mean of empty slice" warnings globally (we handle empties explicitly)
 warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
 
@@ -46,6 +56,36 @@ warnings.filterwarnings("ignore", message="Mean of empty slice", category=Runtim
 # ---------------------------
 # Reproducibility & utilities
 # ---------------------------
+
+def ddp_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+def ddp_setup():
+    """Initialize DDP if launched with torchrun."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return local_rank, dist.get_rank(), dist.get_world_size()
+    else:
+        return None, 0, 1  # single-process fallback
+
+def ddp_cleanup():
+    if ddp_is_initialized():
+        dist.destroy_process_group()
+
+
+def ddp_broadcast_scalar(val, device, dtype=torch.float32):
+    """Broadcast a Python scalar from rank 0 to all ranks and return it (on every rank)."""
+    if not ddp_is_initialized():
+        return val
+    t = torch.tensor([val], device=device, dtype=dtype)
+    dist.broadcast(t, src=0)
+    if dtype in (torch.int32, torch.int64, torch.bool):
+        return int(t.item())
+    return float(t.item())
+
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -57,6 +97,10 @@ def set_seed(seed: int = 42):
         torch.set_float32_matmul_precision('high')
     except Exception:
         pass
+    
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 
 
 def ensure_dir(p: str):
@@ -92,6 +136,75 @@ def valid_mask(arr: np.ndarray, sentinel: float = -9999.0) -> np.ndarray:
 def ensure_chw(t: torch.Tensor) -> torch.Tensor:
     """Ensure tensor has shape [1,H,W] (accepts [H,W] or [1,H,W])."""
     return t.unsqueeze(0) if t.dim() == 2 else t
+
+
+
+
+def _is_zarr_store(path: str) -> bool:
+    # Heuristics: endswith '.zarr' or contains consolidated metadata
+    if path.endswith(".zarr"):
+        return True
+    if os.path.isdir(path) and os.path.exists(os.path.join(path, ".zmetadata")):
+        return True
+    return False
+
+# def open_multi_auto(paths: List[str], time_dim: str, prefer_chunks_time1: bool = True):
+#     """
+#     Open a list of paths that may be NetCDFs (.nc) or Zarr stores (.zarr).
+#     Returns an xarray.Dataset ready for lazy windowed reads.
+#     """
+#     if len(paths) == 1:
+#         p = paths[0]
+#         if _is_zarr_store(p):
+#             # consolidated=True speeds metadata; chunks here tell Dask how to index 'time'
+#             ds = xr.open_zarr(p, consolidated=True, chunks={time_dim: 1} if prefer_chunks_time1 else None)
+#         else:
+#             ds = xr.open_dataset(p, engine="netcdf4")
+#             # If you want to avoid chunk-splitting warnings on NetCDF,
+#             # you can choose to *not* set chunks here and rely on slicing in Dataset.
+#             # Or, if you know on-disk time chunk (e.g., 72), you can do:
+#             # ds = ds.chunk({time_dim: 72})
+#         return ds
+
+#     # Multiple paths: use open_mfdataset
+#     all_zarr = all(_is_zarr_store(p) for p in paths)
+#     if all_zarr:
+#         ds = xr.open_mfdataset(
+#             paths, engine="zarr", combine="by_coords",
+#             chunks={time_dim: 1} if prefer_chunks_time1 else None,
+#             backend_kwargs={"consolidated": True}
+#         )
+#     else:
+#         ds = xr.open_mfdataset(paths, engine="netcdf4", combine="by_coords")
+#         # Same comment as above: you may choose to .chunk({time_dim: <on-disk-time-chunk>})
+#         # if you want to avoid chunk-splitting warnings.
+#     return ds
+
+
+def open_multi_auto(paths: List[str], time_dim: str, prefer_chunks_time1: bool = True):
+    # prefer_chunks_time1 flag becomes NO-OP for Zarr to avoid splitting
+    if len(paths) == 1:
+        p = paths[0]
+        if _is_zarr_store(p):
+            # ⬇️ REMOVE the chunks=... line to avoid splitting stored chunks
+            return xr.open_zarr(p, consolidated=True)
+        else:
+            return xr.open_dataset(p, engine="netcdf4")
+
+    # Multi-path
+    all_zarr = all(_is_zarr_store(p) for p in paths)
+    if all_zarr:
+        return xr.open_mfdataset(
+            paths,
+            engine="zarr",
+            combine="by_coords",
+            backend_kwargs={"consolidated": True}
+            # ⬆️ NO chunks= here either; use native chunking
+        )
+    else:
+        return xr.open_mfdataset(paths, engine="netcdf4", combine="by_coords")
+
+
 
 
 # ---------------------------
@@ -186,10 +299,10 @@ class Config:
     # Training
     epochs: int = 50
     min_epochs: int = 10
-    batch_size: int = 2 #was 4, reduced to save memory.  Could be 1, but using torch.nn.dataparallel and so it has to be atleast 2 to reach 2 gpus.
+    batch_size: int = 4 #was 4, reduced to save memory.  Could be 1, but using torch.nn.dataparallel and so it has to be atleast 2 to reach 2 gpus.
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
-    base_ch: int = 32 #was 64 reduced to save memory
+    base_ch: int = 64 #was 64 reduced to save memory
     num_workers: int = 2
     amp: bool = True
     patience: int = 8
@@ -219,6 +332,33 @@ class Config:
     x_val_paths:   List[str] = None   # list of NetCDF/Zarr for X (val);   if None -> degrade Y
     x_pre_paths:   List[str] = None   # list of NetCDF/Zarr for X during inference; if None -> degrade Y
     x_var: Optional[str] = None       # variable name for X (defaults to prism_var if None)             Y is with radar and X is without radar
+ 
+
+    # --- Training from spatial crops ---
+    patch: int = 768                 # crop size H=W
+    train_crops_per_epoch: int = 20000   # synthetic length: how many random crops per epoch.  Multiple of 4
+    val_crop_mode: str = "random"    # 'random' or 'tile'
+    val_crops_per_epoch: int = 4000  # used when val_crop_mode == 'random'
+    val_tile: Optional[int] = None   # if None, default to cfg.tile
+    val_tile_overlap: Optional[int] = None  # if None, default to cfg.tile_overlap
+
+    degrade_in_dataset: bool = False  # new: do heavy ops in training step on GPU    
+    
+    
+    patch = 768
+    base_ch = 96
+    batch_size: int = 8          
+    w_grad = 0.3
+    w_spec = 0.05
+    w_hp   = 0.2
+    w_fss  = 0.02
+    degrade_gauss_sigma_min = 1.0
+    degrade_gauss_sigma_max = 3.0
+    degrade_spectral_cutoff_min = 0.08
+    degrade_spectral_cutoff_max = 0.25
+    tile_overlap: int = 192
+    patience: int = 8
+ 
     # ...
 
     def __post_init__(self):
@@ -278,6 +418,10 @@ def apply_degradation(y_mm: torch.Tensor, cfg: Config) -> torch.Tensor:
     return torch.clamp(x, min=0.0)
 
 
+def highpass(z: torch.Tensor, sigma: float = 1.5) -> torch.Tensor:
+    # HP = identity - gaussian low-pass; z in transformed space
+    return z - gaussian_blur2d(z, sigma)
+
 # ---------------------------
 # Transforms
 # ---------------------------
@@ -306,7 +450,395 @@ def add_noise_transformed(z: torch.Tensor, std: float) -> torch.Tensor:
 
 
 # ---------------------------
-# Dataset
+# Dataset (random crops or deterministic tiles)
+# ---------------------------
+class PrismCropsDataset(Dataset):
+    """
+    Yields (X, Y, M) tensors for either random crops (training) or tiled windows (validation).
+
+    - Loads full Y (and optional X) into host RAM ONCE (as before), but only returns a small
+      HxW window per sample. GPU memory drops ~quadratically with patch size.
+    - Channels in X: [x_tr, (dem?) , mask, clim_tr]
+    - If no external X is provided, X is made by degrading Y (your radar-off emulation).
+
+    Modes:
+      * mode='train' -> random crops; __len__ = train_crops_per_epoch
+      * mode='val'   -> 'random' or 'tile' depending on cfg.val_crop_mode
+    """
+    def __init__(self,
+                 data_arrays: List[np.ndarray],           # list of [T_i,H,W] -> concat time
+                 static_dem: Optional[np.ndarray],
+                 static_mask: Optional[np.ndarray],
+                 transform: str,
+                 cfg: Config,
+                 x_arrays: Optional[List[np.ndarray]] = None,  # optional external X [T,H,W]
+                 mode: str = "train"):
+        super().__init__()
+        self.cfg = cfg
+        self.transform = transform
+        self.mode = mode
+
+        # --- Concatenate Y (targets) over time: [T,H,W]
+        self.Y = np.concatenate(data_arrays, axis=0).astype(np.float32)
+        self.T, self.H, self.W = self.Y.shape
+
+        # --- Optional external X aligned to Y
+        self.X = None
+        if x_arrays is not None:
+            Xcat = np.concatenate(x_arrays, axis=0).astype(np.float32)
+            if Xcat.shape != self.Y.shape:
+                raise ValueError(
+                    f"External X shape {Xcat.shape} does not match Y shape {self.Y.shape}. "
+                    "Ensure time/lat/lon alignment and identical grid."
+                )
+            self.X = Xcat
+
+        # --- Optional DEM / static mask
+        self.dem = None
+        if static_dem is not None and cfg.use_dem:
+            dem = static_dem.astype(np.float32)
+            dem = (dem - np.nanmean(dem)) / (np.nanstd(dem) + 1e-6)
+            dem = np.where(np.isfinite(dem), dem, 0.0)
+            self.dem = dem  # [H,W]
+
+        self.user_static_mask = None
+        if static_mask is not None and cfg.use_mask:
+            m = (static_mask > 0.5).astype(np.float32)
+            m = np.where(np.isfinite(m), m, 0.0)
+            self.user_static_mask = m  # [H,W]
+
+        # --- Domain mask from Y: valid at least once over time
+        mask_all = valid_mask(self.Y, sentinel=-9999.0).astype(np.float32)   # [T,H,W]
+        domain_mask = (np.nanmax(mask_all, axis=0) > 0.5).astype(np.float32) # [H,W]
+        self.domain_mask = domain_mask
+        print(f"[Dataset] Domain valid fraction: {float(domain_mask.mean()):.3f}")
+
+        # --- Climatology in mm (mean over time where valid)
+        Y_masked = np.where(mask_all > 0.5, self.Y, np.nan)
+        clim = np.nanmean(Y_masked, axis=0).astype(np.float32)  # [H,W]
+        empty = ~np.isfinite(clim)
+        if empty.any():
+            print(f"[Dataset] Climatology: {int(empty.sum())} pixels had no valid data; filled 0.")
+        clim = np.where(np.isfinite(clim), clim, 0.0)
+        self.clim = clim
+
+        # --- Crop window planning
+        self.patch = int(getattr(cfg, "patch", 256))
+        # Safety for small grids
+        self.patch_h = min(self.patch, self.H)
+        self.patch_w = min(self.patch, self.W)
+
+        if self.mode == "train":
+            # synthetic length controls steps/epoch
+            self.N = int(getattr(cfg, "train_crops_per_epoch", 20000))
+            self._sampler = self._random_sampler
+        else:
+            val_mode = getattr(cfg, "val_crop_mode", "random").lower()
+            if val_mode == "tile":
+                vt = cfg.val_tile or cfg.tile
+                vo = cfg.val_tile_overlap or cfg.tile_overlap
+                self.tile = int(vt)
+                self.tile_overlap = int(vo)
+                self._make_val_tiles()  # sets self.tiles = [(t, y0, x0, h, w), ...]
+                self.N = len(self.tiles)
+                self._sampler = self._tile_sampler
+                print(f"[ValTiles] {self.N} tiles (tile={self.tile}, overlap={self.tile_overlap})")
+            else:
+                self.N = int(getattr(cfg, "val_crops_per_epoch", 4000))
+                self._sampler = self._random_sampler
+
+        # RNGs
+        self._rng_py = random.Random(cfg.seed if self.mode == "train" else cfg.seed + 1)
+
+    # -------- samplers --------
+    def _random_sampler(self, idx: int) -> Tuple[int, int, int, int, int]:
+        t = self._rng_py.randrange(self.T)
+        y0 = self._rng_py.randrange(0, max(1, self.H - self.patch_h + 1))
+        x0 = self._rng_py.randrange(0, max(1, self.W - self.patch_w + 1))
+        return t, y0, x0, self.patch_h, self.patch_w
+
+    def _make_val_tiles(self):
+        step = self.tile - self.tile_overlap
+        tiles = []
+        for t in range(self.T):
+            for y0 in range(0, self.H, step):
+                for x0 in range(0, self.W, step):
+                    y1 = min(y0 + self.tile, self.H)
+                    x1 = min(x0 + self.tile, self.W)
+                    tiles.append((t, y0, x0, y1 - y0, x1 - x0))
+        self.tiles = tiles
+
+    def _tile_sampler(self, idx: int) -> Tuple[int, int, int, int, int]:
+        return self.tiles[idx]
+
+    # -------- helpers --------
+    def __len__(self) -> int:
+        return self.N
+
+    def _slice2d(self, arr2d: np.ndarray, y0: int, x0: int, h: int, w: int) -> np.ndarray:
+        return arr2d[y0:y0+h, x0:x0+w]
+
+    def _slice3d_t(self, arr3d: np.ndarray, t: int, y0: int, x0: int, h: int, w: int) -> np.ndarray:
+        return arr3d[t, y0:y0+h, x0:x0+w]
+
+    def __getitem__(self, idx: int):
+        # ---- pick window ----
+        t, y0, x0, h, w = self._sampler(idx)
+
+        # ---- Target y_mm crop & its mask ----
+        y_mm = self._slice3d_t(self.Y, t, y0, x0, h, w)   # [h,w]
+        m_data = valid_mask(y_mm, sentinel=-9999.0).astype(np.float32)   # [h,w]
+        m_dom  = self._slice2d(self.domain_mask, y0, x0, h, w)           # [h,w]
+        m = (m_data * m_dom).astype(np.float32)
+        if self.user_static_mask is not None:
+            m = (m * (self._slice2d(self.user_static_mask, y0, x0, h, w) > 0.5).astype(np.float32)).astype(np.float32)
+
+        # sanitize target
+        y_mm = np.where(m > 0.5, np.clip(y_mm, 0.0, 1e6), 0.0).astype(np.float32)
+        y_t  = torch.from_numpy(y_mm)[None, ...]  # [1,h,w]
+
+        # ---- Input X (external or degraded) in mm ----
+        if self.X is not None:
+            x_np = self._slice3d_t(self.X, t, y0, x0, h, w)
+            x_np = np.where(np.isfinite(x_np), x_np, 0.0).astype(np.float32)
+            x_np = np.where(m > 0.5, np.clip(x_np, 0.0, 1e6), 0.0)
+            x_mm = torch.from_numpy(x_np)[None, ...]  # [1,h,w]
+        else:
+            # degrade Y -> X (mm space)
+            #x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)  # [1,h,w]
+            #x_mm = x_mm * torch.from_numpy(m)[None, ...]
+            
+            # ⚠️ If we're doing degradation on GPU, just pass Y as X (in mm), no heavy ops here.
+            if not self.cfg.degrade_in_dataset:
+                x_mm = y_t.clone()  # [1,h,w], mm space, no blur/FFT on CPU
+            else:
+                # CPU-side degrade (only if explicitly requested)
+                x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)
+            x_mm = x_mm * torch.from_numpy(m)[None, ...]
+
+
+        # ---- transform to training space & add noise on input ----
+        y_tr = mm_to_transform(y_t, self.transform).float()
+        x_tr = mm_to_transform(x_mm, self.transform).float()
+        x_tr = add_noise_transformed(x_tr, self.cfg.degrade_additive_noise_std)
+        x_tr = x_tr * torch.from_numpy(m)[None, ...]
+
+        # ---- static channels: dem, mask, climatology (transformed) ----
+        chans = [x_tr]
+        if self.dem is not None:
+            chans.append(torch.from_numpy(self._slice2d(self.dem, y0, x0, h, w))[None, ...])
+        chans.append(torch.from_numpy(m)[None, ...])  # mask channel
+        clim_crop = self._slice2d(self.clim, y0, x0, h, w).astype(np.float32)
+        clim_tr = mm_to_transform(torch.from_numpy(clim_crop)[None, ...], self.transform)
+        clim_tr = clim_tr * torch.from_numpy(m)[None, ...]
+        chans.append(clim_tr)
+
+        X = torch.cat(chans, dim=0).float()            # [C,h,w]
+        Y = y_tr.float()                                # [1,h,w]
+        M = torch.from_numpy(m)[None, ...].float()      # [1,h,w]
+        return X, Y, M
+    
+
+# ---------------------------
+# Streaming random crops from NetCDF/Zarr via xarray+dask.  Loads partial input grids
+# ---------------------------
+class XRRandomPatchDataset(Dataset):
+    """
+    Random (or tiled) patches streamed from NetCDF/Zarr without preloading entire arrays.
+
+    - Y paths (with radar) are required.
+    - X paths (without radar) optional; if not provided, X is made by degrading Y.
+    - Builds domain_mask (any valid over time) and climatology as 2D arrays via dask compute.
+    - Channels: [x_tr, (dem?), mask, clim_tr] — identical to your training recipe.
+    """
+
+    def __init__(
+        self,
+        y_paths: List[str],
+        x_paths: Optional[List[str]],
+        cfg: Config,
+        mode: str = "train",
+    ):
+        super().__init__()
+        assert xr is not None, "xarray is required."
+
+        self.cfg = cfg
+        self.mode = mode
+        self.patch = int(getattr(cfg, "patch", 256))
+        self.transform = cfg.transform
+
+        # Safer open (time-chunked) → pulls small windows; engine='netcdf4' helps on many systems.
+      #  self.ds_y = xr.open_mfdataset(
+      #      y_paths, combine="by_coords",
+      #      chunks={cfg.time_name: 1}, engine="netcdf4"
+      #  )
+      
+        self.ds_y = open_multi_auto(y_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
+
+        self.var_y = cfg.prism_var
+        self.t_dim = cfg.time_name
+        # Infer spatial dims from the variable dims (last two)
+        v = self.ds_y[self.var_y]
+        self.y_dim = v.dims[-2]
+        self.x_dim = v.dims[-1]
+        self.T = int(self.ds_y.sizes[self.t_dim])
+        self.H = int(self.ds_y.sizes[self.y_dim])
+        self.W = int(self.ds_y.sizes[self.x_dim])
+
+        # Optional X
+     #   self.ds_x = None
+     #   if x_paths:
+     #       self.ds_x = xr.open_mfdataset(
+     #           x_paths, combine="by_coords",
+     #           chunks={cfg.time_name: 1}, engine="netcdf4"
+     #       )
+     #       self.var_x = cfg.x_var or cfg.prism_var
+
+        if x_paths:
+            self.ds_x = open_multi_auto(x_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
+            self.var_x = cfg.x_var or cfg.prism_var
+        else:
+            self.ds_x = None
+
+        # Compute 2D domain mask (valid at least once) out-of-core
+        # This streams over time and keeps only [H,W] in memory at the end.
+        mask_any = self.ds_y[self.var_y].pipe(xr.ufuncs.isfinite).any(dim=self.t_dim)
+        self.domain_mask = mask_any.compute().astype(np.float32).values  # [H,W]
+
+        # Compute climatology (2D) out-of-core
+        clim = self.ds_y[self.var_y].where(xr.ufuncs.isfinite(self.ds_y[self.var_y])).mean(dim=self.t_dim)
+        clim = clim.fillna(0.0)
+        self.clim = clim.compute().astype(np.float32).values  # [H,W]
+
+        # Optional statics (small, OK to load)
+        self.dem = None
+        if cfg.use_dem and cfg.static_dem_path:
+            dem = load_static(cfg.static_dem_path)
+            if dem is not None:
+                dem = (dem - np.nanmean(dem)) / (np.nanstd(dem) + 1e-6)
+                dem = np.where(np.isfinite(dem), dem, 0.0)
+                self.dem = dem.astype(np.float32)
+
+        self.user_static_mask = None
+        if cfg.use_mask and cfg.static_mask_path:
+            sm = load_static(cfg.static_mask_path)
+            if sm is not None:
+                sm = (sm > 0.5).astype(np.float32)
+                sm = np.where(np.isfinite(sm), sm, 0.0)
+                self.user_static_mask = sm.astype(np.float32)
+
+        # Length (synthetic) and sampler
+        if mode == "train":
+            self.N = int(getattr(cfg, "train_crops_per_epoch", 20000))
+            self._sampler = self._random_sampler
+            self._rng = random.Random(cfg.seed)
+        else:
+            val_mode = getattr(cfg, "val_crop_mode", "random").lower()
+            if val_mode == "tile":
+                vt = cfg.val_tile or cfg.tile
+                vo = cfg.val_tile_overlap or cfg.tile_overlap
+                self._make_tiles(vt, vo)
+                self.N = len(self.tiles)
+                self._sampler = self._tile_sampler
+            else:
+                self.N = int(getattr(cfg, "val_crops_per_epoch", 4000))
+                self._sampler = self._random_sampler
+                self._rng = random.Random(cfg.seed + 1)
+
+    def __len__(self):
+        return self.N
+
+    def _random_sampler(self, idx):
+        t = self._rng.randrange(self.T)
+        h = min(self.patch, self.H)
+        w = min(self.patch, self.W)
+        y0 = self._rng.randrange(0, max(1, self.H - h + 1))
+        x0 = self._rng.randrange(0, max(1, self.W - w + 1))
+        return t, y0, x0, h, w
+
+    def _make_tiles(self, tile, overlap):
+        step = tile - overlap
+        tiles = []
+        for t in range(self.T):
+            for y0 in range(0, self.H, step):
+                for x0 in range(0, self.W, step):
+                    y1 = min(y0 + tile, self.H)
+                    x1 = min(x0 + tile, self.W)
+                    tiles.append((t, y0, x0, y1 - y0, x1 - x0))
+        self.tiles = tiles
+
+    def _tile_sampler(self, idx):
+        return self.tiles[idx]
+
+    def _window(self, ds, var, t, y0, x0, h, w):
+        sl = ds[var].isel(
+            **{
+                self.t_dim: t,
+                self.y_dim: slice(y0, y0 + h),
+                self.x_dim: slice(x0, x0 + w),
+            }
+        )
+        # Materialize only this small slice
+        return np.asarray(sl.load().data, dtype=np.float32)
+
+    def __getitem__(self, idx):
+        t, y0, x0, h, w = self._sampler(idx)
+
+        # --- Y patch (mm) and masks
+        y_mm = self._window(self.ds_y, self.var_y, t, y0, x0, h, w)   # [h,w]
+        m_data = valid_mask(y_mm, sentinel=-9999.0).astype(np.float32)
+        m_dom  = self.domain_mask[y0:y0+h, x0:x0+w]
+        m = (m_data * m_dom).astype(np.float32)
+        if self.user_static_mask is not None:
+            m = (m * (self.user_static_mask[y0:y0+h, x0:x0+w] > 0.5).astype(np.float32)).astype(np.float32)
+
+        y_mm = np.where(m > 0.5, np.clip(y_mm, 0.0, 1e6), 0.0).astype(np.float32)
+        y_t  = torch.from_numpy(y_mm)[None, ...]   # [1,h,w]
+
+        # --- X (mm): external or degrade(Y)
+        if self.ds_x is not None:
+            x_np = self._window(self.ds_x, self.var_x, t, y0, x0, h, w)
+            x_np = np.where(np.isfinite(x_np), x_np, 0.0).astype(np.float32)
+            x_np = np.where(m > 0.5, np.clip(x_np, 0.0, 1e6), 0.0)
+            x_mm = torch.from_numpy(x_np)[None, ...]
+        else:
+         #   x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)
+         #   x_mm = x_mm * torch.from_numpy(m)[None, ...]
+            
+            # ⚠️ If we're doing degradation on GPU, just pass Y as X (in mm), no heavy ops here.
+            if not self.cfg.degrade_in_dataset:
+                x_mm = y_t.clone()  # [1,h,w], mm space, no blur/FFT on CPU
+            else:
+                # CPU-side degrade (only if explicitly requested)
+                x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)
+            x_mm = x_mm * torch.from_numpy(m)[None, ...]
+
+
+        # --- Transform space + small noise on input
+        y_tr = mm_to_transform(y_t, self.transform).float()
+        x_tr = mm_to_transform(x_mm, self.transform).float()
+        x_tr = add_noise_transformed(x_tr, self.cfg.degrade_additive_noise_std)
+        x_tr = x_tr * torch.from_numpy(m)[None, ...]
+
+        # --- Build channels
+        chans = [x_tr]
+        if self.dem is not None:
+            chans.append(torch.from_numpy(self.dem[y0:y0+h, x0:x0+w])[None, ...])
+        chans.append(torch.from_numpy(m)[None, ...])
+
+        clim_crop = self.clim[y0:y0+h, x0:x0+w].astype(np.float32)
+        clim_tr = mm_to_transform(torch.from_numpy(clim_crop)[None, ...], self.transform)
+        clim_tr = clim_tr * torch.from_numpy(m)[None, ...]
+        chans.append(clim_tr)
+
+        X = torch.cat(chans, dim=0).float()        # [C,h,w]
+        Y = y_tr.float()                            # [1,h,w]
+        M = torch.from_numpy(m)[None, ...].float()  # [1,h,w]
+        return X, Y, M
+    
+
+# ---------------------------
+# Dataset  Loads entire NetCDF input grids
 # ---------------------------
 class PrismDataset(torch.utils.data.Dataset):
     """
@@ -745,160 +1277,544 @@ def write_bil_pair(
 # ---------------------------
 # Training
 # ---------------------------
+# def train(cfg: Config):
+#     set_seed(cfg.seed)
+#     #device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    
+#     local_rank, global_rank, world_size = ddp_setup()
+#     if local_rank is not None:
+#         device = torch.device(f"cuda:{local_rank}")
+#         is_main = (global_rank == 0)
+#     else:
+#         device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+#         is_main = True
+
+#     ensure_dir(cfg.out_dir)
+#     with open(os.path.join(cfg.out_dir, "config.json"), "w") as f:
+#         json.dump(asdict(cfg), f, indent=2)
+
+#     # Load Y.  These work with the full netcdf files.  Can cause OOM with multiple year training
+#     # Y_train = load_prism_arrays(cfg.prism_train_paths, cfg.prism_var, cfg.time_name)
+#     # Y_val   = load_prism_arrays(cfg.prism_val_paths,   cfg.prism_var, cfg.time_name)
+
+#     # # Optionally load X (external; else None -> degrade Y)
+#     # x_var_name = cfg.x_var or cfg.prism_var
+#     # X_train = load_arrays(cfg.x_train_paths, x_var_name, cfg.time_name) if cfg.x_train_paths else None
+#     # X_val   = load_arrays(cfg.x_val_paths,   x_var_name, cfg.time_name) if cfg.x_val_paths   else None
+
+#     # Statics
+#     static_dem  = load_static(cfg.static_dem_path) if cfg.use_dem else None
+#     static_mask = load_static(cfg.static_mask_path) if cfg.use_mask else None
+#     if static_mask is not None:
+#         static_mask = (static_mask > 0.5).astype(np.float32)
+
+#     # Datasets (crop - unaware)
+#     # ds_tr = PrismDataset([Y_train], static_dem, static_mask, cfg.transform, cfg, x_arrays=[X_train] if X_train is not None else None)
+#     # ds_va = PrismDataset([Y_val],   static_dem, static_mask, cfg.transform, cfg, x_arrays=[X_val]   if X_val   is not None else None)
+
+#     # dl_tr = torch.utils.data.DataLoader(
+#     #     ds_tr, batch_size=cfg.batch_size, shuffle=True,
+#     #     num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
+#     #     persistent_workers=(cfg.num_workers > 0), prefetch_factor=2
+#     # )
+#     # dl_va = torch.utils.data.DataLoader(
+#     #     ds_va, batch_size=cfg.batch_size, shuffle=False,
+#     #     num_workers=cfg.num_workers, pin_memory=True,
+#     #     persistent_workers=(cfg.num_workers > 0), prefetch_factor=2
+#     # )
+
+#     # Datasets (crop-aware)
+#     # ds_tr = PrismCropsDataset(
+#     #     [Y_train], static_dem, static_mask,
+#     #     cfg.transform, cfg,
+#     #     x_arrays=[X_train] if X_train is not None else None,
+#     #     mode="train"
+#     # )
+#     # ds_va = PrismCropsDataset(
+#     #     [Y_val], static_dem, static_mask,
+#     #     cfg.transform, cfg,
+#     #     x_arrays=[X_val] if X_val is not None else None,
+#     #     mode="val"
+#     # )
+
+#     # dl_tr = torch.utils.data.DataLoader(
+#     #     ds_tr,
+#     #     batch_size=cfg.batch_size, shuffle=False,   # randomness comes from dataset's sampler
+#     #     num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
+#     #     persistent_workers=(cfg.num_workers > 0), prefetch_factor=2 if cfg.num_workers > 0 else None
+#     # )
+#     # dl_va = torch.utils.data.DataLoader(
+#     #     ds_va,
+#     #     batch_size=cfg.batch_size, shuffle=False,
+#     #     num_workers=min(2, cfg.num_workers), pin_memory=True,
+#     #     persistent_workers=(cfg.num_workers > 0), prefetch_factor=2 if cfg.num_workers > 0 else None
+#     # )
+
+#     # ✨ NEW: streaming datasets (no full-array preload)
+#     ds_tr = XRRandomPatchDataset(
+#         y_paths=cfg.prism_train_paths,
+#         x_paths=cfg.x_train_paths,
+#         cfg=cfg,
+#         mode="train",
+#     )
+#     ds_va = XRRandomPatchDataset(
+#         y_paths=cfg.prism_val_paths,
+#         x_paths=cfg.x_val_paths,
+#         cfg=cfg,
+#         mode="val",
+#     )
+
+#     # Build loaders — start SAFE to verify no “Killed”
+#     dl_tr = torch.utils.data.DataLoader(
+#         ds_tr,
+#         batch_size=cfg.batch_size,
+#         shuffle=False,                 # randomness comes from dataset sampler
+#         num_workers=0,                 # 🔴 start with 0 to avoid forking copies
+#         pin_memory=True,
+#         drop_last=True,
+#         persistent_workers=False,
+#     )
+#     dl_va = torch.utils.data.DataLoader(
+#         ds_va,
+#         batch_size=cfg.batch_size,
+#         shuffle=False,
+#         num_workers=0,                 # 🔴 start with 0
+#         pin_memory=True,
+#         persistent_workers=False,
+#     )
+
+#     # Model
+#     sample_x, _, _ = ds_tr[0]
+#     in_ch = sample_x.shape[0]
+#    # model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
+   
+#     model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
+#     model = model.to(memory_format=torch.channels_last)  # <-- add this line
+
+#     print(f"Model params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    
+#    # if torch.cuda.device_count() > 1:
+#    #     model = torch.nn.DataParallel(model)
+
+#     if ddp_is_initialized():
+#         model = torch.nn.parallel.DistributedDataParallel(
+#             model, device_ids=[device.index], output_device=device.index,
+#             find_unused_parameters=False  # keeps comms lean
+#         )
+
+
+#     # Optimizer & AMP
+#     # opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+#     # try:
+#     #     scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp and device.type == "cuda")
+#     #     def autocast_cm(): return torch.autocast('cuda', enabled=cfg.amp and device.type == "cuda")
+#     # except Exception:
+#     #     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and device.type == "cuda")
+#     #     def autocast_cm(): return torch.cuda.amp.autocast(enabled=cfg.amp and device.type == "cuda")
+
+#     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    
+#     # Use bf16 on H100s; typically no scaler needed for bf16
+#     def autocast_cm():
+#         return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(cfg.amp and device.type == "cuda"))
+    
+#     scaler = None  # not used with bf16
+
+#     # LR scheduler on plateau (no verbose to support older torch)
+#     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+#         opt, mode='min', factor=0.5, patience=4, threshold=1e-5
+#     )
+
+#     # Early stopping & checkpoints
+#     best_val = float('inf'); best_epoch = -1; patience_ctr = 0
+#     ckpt_best = os.path.join(cfg.out_dir, cfg.ckpt_name)
+#     ckpt_last = os.path.join(cfg.out_dir, "last.pt")
+
+#     for epoch in range(1, cfg.epochs + 1):
+#         model.train()
+#         tr_losses = []
+#         pbar = tqdm(dl_tr, desc=f"Epoch {epoch}/{cfg.epochs} [train]")
+#         for X, Y_true, M in pbar:
+#            # X = to_device(X, device); Y_true = to_device(Y_true, device); M = to_device(M, device)
+           
+#             X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+#             Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+#             M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+
+#             opt.zero_grad(set_to_none=True)
+            
+
+#             # If no external X and we disabled dataset-side degradation, do it here on GPU.
+#             if (cfg.x_train_paths is None) and (not cfg.degrade_in_dataset):
+#                 with torch.no_grad():
+#                     # Channel-0 currently holds x in *mm* (from dataset). Convert, degrade, and put back as transformed.
+#                    # x_mm = X[:, 0:1]                                  # [B,1,H,W] mm
+#                    # x_mm = torch.clamp(x_mm, min=0.0)
+#                    # x_mm = apply_degradation(x_mm, cfg)               # blur/FFT/damp on GPU
+#                    # x_tr = mm_to_transform(x_mm, cfg.transform)       # transformed for the model
+#                    # X = torch.cat([x_tr, X[:, 1:]], dim=1)            # replace channel-0
+
+            
+#                     # channel-0 is transformed; invert to mm, degrade, then re-transform
+#                     x_mm = transform_to_mm(X[:, 0:1], cfg.transform)
+#                     x_mm = torch.clamp(x_mm, min=0.0)
+#                     x_mm = apply_degradation(x_mm, cfg)
+#                     x_tr = mm_to_transform(x_mm, cfg.transform)
+#                     X = torch.cat([x_tr, X[:, 1:]], dim=1)
+            
+#             with autocast_cm():
+#                 delta = model(X)
+#                 Y_pred_tr = X[:, 0:1] + delta
+#                 # Data loss (masked)
+#                 if cfg.loss == "huber":
+#                     data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
+#                 else:
+#                     data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+#                 # Gradient & mm penalties
+#                 gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+#                 Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
+#                 Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
+#                 spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+#                 mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+#                 loss = data_loss + gl + spec + mass
+
+#             #scaler.scale(loss).backward()
+#             #scaler.step(opt)
+#             #scaler.update()
+            
+#             loss.backward()
+#             opt.step()
+
+#             tr_losses.append(loss.item())
+#             pbar.set_postfix(loss=np.mean(tr_losses))
+
+#         # Validation
+#         model.eval()
+#         va_losses, va_rmse, va_mae = [], [], []
+#         fss_scores: Dict[float, List[float]] = {thr: [] for thr in cfg.fss_thresholds}
+#         with torch.no_grad():
+#             for X, Y_true, M in tqdm(dl_va, desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
+#               #  X = to_device(X, device); Y_true = to_device(Y_true, device); M = to_device(M, device)
+              
+#                 X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+#                 Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+#                 M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+
+#                 Y_pred_tr = X[:, 0:1] + model(X)
+#                 if cfg.loss == "huber":
+#                     data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
+#                 else:
+#                     data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+#                 gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+#                 Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
+#                 Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
+#                 spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+#                 mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+#                 vloss = data_loss + gl + spec + mass
+#                 va_losses.append(vloss.item())
+#                 va_rmse.append(rmse(Y_pred_mm, Y_true_mm, mask=M).item())
+#                 va_mae.append(mae(Y_pred_mm, Y_true_mm, mask=M).item())
+#                 for thr in cfg.fss_thresholds:
+#                     fss_scores[thr].append(
+#                         fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
+#                     )
+
+#         mean_val = float(np.mean(va_losses)) if len(va_losses) else float('inf')
+#         mean_rmse = float(np.mean(va_rmse)) if len(va_rmse) else float('inf')
+#         mean_mae = float(np.mean(va_mae)) if len(va_mae) else float('inf')
+#         mean_fss = {thr: float(np.mean(v)) for thr, v in fss_scores.items()}
+#         print(f"[Val] loss={mean_val:.4f} rmse={mean_rmse:.3f} mae={mean_mae:.3f} "
+#               + " ".join([f"FSS@{thr}={mean_fss[thr]:.3f}" for thr in cfg.fss_thresholds]))
+
+#         # Scheduler
+#         if np.isfinite(mean_val):
+#             scheduler.step(mean_val)
+
+#         # Save "last" (ensure we don't keep 'module.' prefixes to simplify inference)
+#         _sd = get_state_dict(model)
+#         payload = {"model": _sd, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}
+#         torch.save(payload, ckpt_last)
+
+#         # Save "best" if improved
+#         improved = np.isfinite(mean_val) and (mean_val < best_val - 1e-5)
+#         if improved:
+#             best_val = mean_val; best_epoch = epoch; patience_ctr = 0
+#             # Refresh payload with latest state dict in case DataParallel changes
+#             payload = {"model": get_state_dict(model), "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}
+#             torch.save(payload, ckpt_best)
+#             print("  ↳ Saved new best checkpoint:", os.path.abspath(ckpt_best))
+#         else:
+#             patience_ctr += 1
+
+#         # Early stop after min_epochs
+#         if epoch >= cfg.min_epochs and patience_ctr >= cfg.patience:
+#             print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch} (val={best_val:.6f})")
+#             break
+
+#     print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best))
+
+
 def train(cfg: Config):
+    import torch.multiprocessing as mp
+    mp.set_start_method("spawn", force=True)            # safer with NetCDF workers
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
     set_seed(cfg.seed)
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     ensure_dir(cfg.out_dir)
     with open(os.path.join(cfg.out_dir, "config.json"), "w") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    # Load Y
-    Y_train = load_prism_arrays(cfg.prism_train_paths, cfg.prism_var, cfg.time_name)
-    Y_val   = load_prism_arrays(cfg.prism_val_paths,   cfg.prism_var, cfg.time_name)
+    # -----------------------------
+    # DDP setup & device
+    # -----------------------------
+    local_rank, global_rank, world_size = ddp_setup()
+    if local_rank is not None:
+        device = torch.device(f"cuda:{local_rank}")
+        is_main = (global_rank == 0)
+    else:
+        device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+        is_main = True
 
-    # Optionally load X (external; else None -> degrade Y)
-    x_var_name = cfg.x_var or cfg.prism_var
-    X_train = load_arrays(cfg.x_train_paths, x_var_name, cfg.time_name) if cfg.x_train_paths else None
-    X_val   = load_arrays(cfg.x_val_paths,   x_var_name, cfg.time_name) if cfg.x_val_paths   else None
-
-    # Statics
-    static_dem  = load_static(cfg.static_dem_path) if cfg.use_dem else None
-    static_mask = load_static(cfg.static_mask_path) if cfg.use_mask else None
-    if static_mask is not None:
-        static_mask = (static_mask > 0.5).astype(np.float32)
-
-    # Datasets
-    ds_tr = PrismDataset([Y_train], static_dem, static_mask, cfg.transform, cfg, x_arrays=[X_train] if X_train is not None else None)
-    ds_va = PrismDataset([Y_val],   static_dem, static_mask, cfg.transform, cfg, x_arrays=[X_val]   if X_val   is not None else None)
-
-    dl_tr = torch.utils.data.DataLoader(
-        ds_tr, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
-        persistent_workers=(cfg.num_workers > 0), prefetch_factor=2
+    # -----------------------------
+    # Build streaming datasets
+    # -----------------------------
+    ds_tr = XRRandomPatchDataset(
+        y_paths=cfg.prism_train_paths,
+        x_paths=cfg.x_train_paths,
+        cfg=cfg,
+        mode="train",
     )
-    dl_va = torch.utils.data.DataLoader(
-        ds_va, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=True,
-        persistent_workers=(cfg.num_workers > 0), prefetch_factor=2
+    ds_va = XRRandomPatchDataset(
+        y_paths=cfg.prism_val_paths,
+        x_paths=cfg.x_val_paths,
+        cfg=cfg,
+        mode="val",
     )
 
+    # DistributedSampler for training
+    if ddp_is_initialized():
+        train_sampler = DistributedSampler(
+            ds_tr, num_replicas=world_size, rank=global_rank,
+            shuffle=False, drop_last=True
+        )
+    else:
+        train_sampler = None
+
+    # -----------------------------
+    # DataLoaders
+    # -----------------------------
+    from torch.utils.data import DataLoader
+
+    dl_tr = DataLoader(
+        ds_tr,
+        batch_size=cfg.batch_size,             # per-GPU if DDP
+        sampler=train_sampler,
+        shuffle=False,                         # randomness from dataset/sampler
+        num_workers=8,                         # after stability: 8 for train
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
+    dl_va = None
+    if is_main:
+        dl_va = DataLoader(
+            ds_va,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+        )
+
+    # -----------------------------
     # Model
+    # -----------------------------
     sample_x, _, _ = ds_tr[0]
     in_ch = sample_x.shape[0]
+
     model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
-    print(f"Model params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    
-    if torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model)
+    model = model.to(memory_format=torch.channels_last)
 
-    # Optimizer & AMP
+    # DDP wrap (instead of DataParallel)
+    if ddp_is_initialized():
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[device.index], output_device=device.index,
+            find_unused_parameters=False
+        )
+
+    # Optimizer + bf16 autocast (no scaler)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    try:
-        scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp and device.type == "cuda")
-        def autocast_cm(): return torch.autocast('cuda', enabled=cfg.amp and device.type == "cuda")
-    except Exception:
-        scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and device.type == "cuda")
-        def autocast_cm(): return torch.cuda.amp.autocast(enabled=cfg.amp and device.type == "cuda")
+    def autocast_cm():
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                              enabled=(cfg.amp and device.type == "cuda"))
 
-    # LR scheduler on plateau (no verbose to support older torch)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=4, threshold=1e-5
     )
 
-    # Early stopping & checkpoints
     best_val = float('inf'); best_epoch = -1; patience_ctr = 0
     ckpt_best = os.path.join(cfg.out_dir, cfg.ckpt_name)
     ckpt_last = os.path.join(cfg.out_dir, "last.pt")
 
-    for epoch in range(1, cfg.epochs + 1):
+    # -----------------------------
+    # Epoch loop
+    # -----------------------------
+
+    # -----------------------------
+    # Epoch loop (DDP safe, no `break`)
+    # -----------------------------
+    epoch = 1
+    stop_training = False
+    
+    while (epoch <= cfg.epochs) and (not stop_training):
+        # If using DistributedSampler, reseed per-epoch
+        if ddp_is_initialized() and isinstance(dl_tr.sampler, DistributedSampler):
+            dl_tr.sampler.set_epoch(epoch)
+    
+        # ----------------- TRAIN -----------------
         model.train()
-        tr_losses = []
-        pbar = tqdm(dl_tr, desc=f"Epoch {epoch}/{cfg.epochs} [train]")
-        for X, Y_true, M in pbar:
-            X = to_device(X, device); Y_true = to_device(Y_true, device); M = to_device(M, device)
+        running = 0.0
+        log_every = 50
+    
+        pbar_iter = tqdm(dl_tr, desc=f"Epoch {epoch}/{cfg.epochs} [train]") if is_main else dl_tr
+    
+        for step, (X, Y_true, M) in enumerate(pbar_iter, 1):
+            # Move to CUDA & channels_last
+            X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    
             opt.zero_grad(set_to_none=True)
+    
+            # Optional on-GPU degradation (when no external X and dataset didn't degrade)
+            if (cfg.x_train_paths is None) and (not cfg.degrade_in_dataset):
+                with torch.no_grad():
+                    x_mm = transform_to_mm(X[:, 0:1], cfg.transform)
+                    x_mm = torch.clamp(x_mm, min=0.0)
+                    x_mm = apply_degradation(x_mm, cfg)
+                    x_tr = mm_to_transform(x_mm, cfg.transform)
+                    X = torch.cat([x_tr, X[:, 1:]], dim=1)
+    
             with autocast_cm():
                 delta = model(X)
                 Y_pred_tr = X[:, 0:1] + delta
-                # Data loss (masked)
+    
                 if cfg.loss == "huber":
                     data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
                 else:
                     data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
-                # Gradient & mm penalties
+    
                 gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
                 Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
                 Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
                 spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
                 mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
                 loss = data_loss + gl + spec + mass
-
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            tr_losses.append(loss.item())
-            pbar.set_postfix(loss=np.mean(tr_losses))
-
-        # Validation
-        model.eval()
-        va_losses, va_rmse, va_mae = [], [], []
-        fss_scores: Dict[float, List[float]] = {thr: [] for thr in cfg.fss_thresholds}
-        with torch.no_grad():
-            for X, Y_true, M in tqdm(dl_va, desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
-                X = to_device(X, device); Y_true = to_device(Y_true, device); M = to_device(M, device)
-                Y_pred_tr = X[:, 0:1] + model(X)
-                if cfg.loss == "huber":
-                    data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
-                else:
-                    data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
-                gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
-                Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
-                Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
-                spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
-                mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-                vloss = data_loss + gl + spec + mass
-                va_losses.append(vloss.item())
-                va_rmse.append(rmse(Y_pred_mm, Y_true_mm, mask=M).item())
-                va_mae.append(mae(Y_pred_mm, Y_true_mm, mask=M).item())
-                for thr in cfg.fss_thresholds:
-                    fss_scores[thr].append(
-                        fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
-                    )
-
-        mean_val = float(np.mean(va_losses)) if len(va_losses) else float('inf')
-        mean_rmse = float(np.mean(va_rmse)) if len(va_rmse) else float('inf')
-        mean_mae = float(np.mean(va_mae)) if len(va_mae) else float('inf')
-        mean_fss = {thr: float(np.mean(v)) for thr, v in fss_scores.items()}
-        print(f"[Val] loss={mean_val:.4f} rmse={mean_rmse:.3f} mae={mean_mae:.3f} "
-              + " ".join([f"FSS@{thr}={mean_fss[thr]:.3f}" for thr in cfg.fss_thresholds]))
-
-        # Scheduler
-        if np.isfinite(mean_val):
-            scheduler.step(mean_val)
-
-        # Save "last" (ensure we don't keep 'module.' prefixes to simplify inference)
-        _sd = get_state_dict(model)
-        payload = {"model": _sd, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}
-        torch.save(payload, ckpt_last)
-
-        # Save "best" if improved
-        improved = np.isfinite(mean_val) and (mean_val < best_val - 1e-5)
-        if improved:
-            best_val = mean_val; best_epoch = epoch; patience_ctr = 0
-            # Refresh payload with latest state dict in case DataParallel changes
-            payload = {"model": get_state_dict(model), "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}
-            torch.save(payload, ckpt_best)
-            print("  ↳ Saved new best checkpoint:", os.path.abspath(ckpt_best))
+    
+            loss.backward()
+            opt.step()
+    
+            # Throttled logging to avoid GPU sync every step
+            running += float(loss.detach())
+            if is_main and (step % log_every == 0) and hasattr(pbar_iter, "set_postfix"):
+                pbar_iter.set_postfix(loss=running / log_every)
+                running = 0.0
+    
+        # -------------- VALIDATION (rank 0 computes) --------------
+        if is_main:
+            model.eval()
+            va_losses, va_rmse, va_mae = [], [], []
+            fss_scores: Dict[float, List[float]] = {thr: [] for thr in cfg.fss_thresholds}
+            with torch.no_grad():
+                for X, Y_true, M in tqdm(dl_va, desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
+                    X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                    Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                    M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    
+                    Y_pred_tr = X[:, 0:1] + model(X)
+                    if cfg.loss == "huber":
+                        data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
+                    else:
+                        data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+                    gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+                    Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
+                    Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
+                    spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+                    mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+                    vloss = data_loss + gl + spec + mass
+                    va_losses.append(float(vloss.detach()))
+                    va_rmse.append(rmse(Y_pred_mm, Y_true_mm, mask=M).item())
+                    va_mae.append(mae(Y_pred_mm, Y_true_mm, mask=M).item())
+                    for thr in cfg.fss_thresholds:
+                        fss_scores[thr].append(
+                            fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
+                        )
+            mean_val = float(np.mean(va_losses)) if len(va_losses) else float('inf')
+            mean_rmse = float(np.mean(va_rmse)) if len(va_rmse) else float('inf')
+            mean_mae  = float(np.mean(va_mae))  if len(va_mae)  else float('inf')
+            mean_fss  = {thr: float(np.mean(v)) for thr, v in fss_scores.items()}
+            print(f"[Val] loss={mean_val:.4f} rmse={mean_rmse:.3f} mae={mean_mae:.3f} "
+                  + " ".join([f"FSS@{thr}={mean_fss[thr]:.3f}" for thr in cfg.fss_thresholds]))
         else:
-            patience_ctr += 1
+            mean_val = float('inf')
+    
+        # --- Broadcast mean_val so EVERY rank steps the scheduler the same way
+        mean_val = ddp_broadcast_scalar(mean_val, device, torch.float32)
+        scheduler.step(mean_val)
+    
+        # --- Rank 0 computes improved & early-stop flags, then broadcast to all ranks
+        if is_main:
+            improved_flag = int(np.isfinite(mean_val) and (mean_val < best_val - 1e-5))
+            should_stop_flag = int(epoch >= cfg.min_epochs and patience_ctr >= cfg.patience)
+        else:
+            improved_flag = 0
+            should_stop_flag = 0
+    
+        improved_flag    = ddp_broadcast_scalar(improved_flag,    device, torch.int32)
+        should_stop_flag = ddp_broadcast_scalar(should_stop_flag, device, torch.int32)
+    
+        # --- Save only on rank 0 if improved; update patience only on rank 0
+        if is_main:
+            # Save "last" (optional)
+            state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+            torch.save({"model": state_dict, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val},
+                       os.path.join(cfg.out_dir, "last.pt"))
+    
+            if improved_flag:
+                best_val = mean_val
+                best_epoch = epoch
+                patience_ctr = 0
+                torch.save({"model": state_dict, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val},
+                           os.path.join(cfg.out_dir, cfg.ckpt_name))
+            else:
+                patience_ctr += 1
+    
+        # --- Barrier so all processes finish the epoch together
+        if ddp_is_initialized():
+            dist.barrier()
+    
+        # --- Early stop decision INSIDE the loop, but without `break`
+        if should_stop_flag:
+            if is_main:
+                print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch} (val={best_val:.6f})")
+            stop_training = True
+    
+        epoch += 1  # advance loop guard
+    
+    # Final sync before cleanup (avoid NCCL teardown races)
+    if ddp_is_initialized():
+        dist.barrier()
+    
+        if ddp_is_initialized():
+            dist.barrier()
 
-        # Early stop after min_epochs
-        if epoch >= cfg.min_epochs and patience_ctr >= cfg.patience:
-            print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch} (val={best_val:.6f})")
-            break
-
-    print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best))
-
+    if is_main:
+        print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best))
+    ddp_cleanup()
 
 # ---------------------------
 # Inference
@@ -1071,6 +1987,7 @@ def infer_on_stack(cfg: Config,
             s_true = (y_t * mask_t).sum()
             scale = (s_true / s_pred.clamp_min(1e-6)).item()
             scale = np.clip(scale, 0.8, 1.25)
+            scale = 1
             y_pred_mm = y_pred_mm * scale
 
             corrected[t] = y_pred_mm.squeeze().detach().cpu().numpy()
@@ -1174,6 +2091,8 @@ def build_arg_parser():
     # NEW: X at inference (optional)
     ap.add_argument("--x_pre_paths", type=str, nargs="*", help="Pre-2001 NetCDF/Zarr files for X during inference; if omitted, X is produced by degrading Y.")
     ap.add_argument("--out_path",    type=str, default="./corrected_pre2001.nc")
+    
+    ap.add_argument("--batch_size", type=int, help="Per-GPU batch size (DDP) or global for single GPU.")
     return ap
 
 
@@ -1202,8 +2121,13 @@ def main():
     if args.static_dem:    cfg.static_dem_path  = args.static_dem
     if args.static_mask:   cfg.static_mask_path = args.static_mask
 
-    if args.out_path:      cfg.out_path  = args.output
+    if args.out_path:      cfg.out_path  = args.out_path
     if args.ckpt:          cfg.ckpt      = args.ckpt
+    
+    
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+
 
     if args.mode == "train":
         assert cfg.prism_train_paths and cfg.prism_val_paths, "Provide --train_paths and --val_paths"
@@ -1253,18 +2177,46 @@ if __name__ == "__main__":
 #              '--pre_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2015.nc '
 #              '--out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/')
 
-#runfile(
+# runfile(
 #    '/nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py',
 #    args="""--mode train
-#            --train_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_ppt_800_2023.nc
-#            --val_paths   /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_ppt_800_2024.nc
-#            --x_train_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2023.nc
-#            --x_val_paths   /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2024.nc
+#            --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc
+#            --val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc
+#            --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.nc
+#            --x_val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc
 #            --out_path     /nfs/pancake/u5/projects/vachek/radar_ai/models/
 #            --ckpt         model_2015_2019.pt
 #            --x_var ppt"""
 
 
+# python -m torch.distributed.run --standalone --nproc_per_node=2 /nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py \
+#   --mode train \
+#   --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc \
+#   --val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc \
+#   --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.nc \
+#   --x_val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc \
+#   --x_var ppt \
+#   --batch_size 2
+
+# python -m torch.distributed.run --standalone --nproc_per_node=2 /nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py \
+#   --mode train \
+#   --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.zarr \
+#   --val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.zarr \
+#   --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.zarr \
+#   --x_val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.zarr \
+#   --x_var ppt \
+#   --batch_size 2
+
+#  python -m torch.distributed.run --standalone --nproc_per_node=2 /nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py \
+#      --mode infer \
+#     --ckpt /nfs/pancake/u5/projects/vachek/automate_qc/runs/convective_correction/best.pt  \
+#     --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc  \
+#     --out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet1/ehdr/800m/ppt/daily/)
+    
+    
+
+
+#python -m torch.distributed.run --standalone --nproc_per_node=2 /nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py --mode infer --ckpt /nfs/pancake/u5/projects/vachek/automate_qc/runs/convective_correction/best.pt --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc --x_pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc --x_var ppt --out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/
 
 
 
