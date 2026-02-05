@@ -28,9 +28,13 @@ def find_bil_files(root_dir, years=(2009, 2010)):
     Returns a list of filepaths.
     """
     paths = []
-    for y in years:
-        pattern1 = os.path.join(root_dir, str(y), "*.bil")
-        pattern2 = os.path.join(root_dir, str(y), "*.BIL")
+    if years != 'NoYearDir':
+        for y in years:
+                pattern1 = os.path.join(root_dir, str(y), "*.bil")
+                pattern2 = os.path.join(root_dir, str(y), "*.BIL")
+    else:
+        pattern1 = os.path.join(root_dir,  "*.bil")
+        pattern2 = os.path.join(root_dir,  "*.BIL")            
         paths.extend(glob.glob(pattern1))
         paths.extend(glob.glob(pattern2))
     return paths
@@ -96,8 +100,8 @@ def stack_to_netcdf(root_dir,
         f for f in all_files
        # if f.lower().endswith('.bil') and include_text in os.path.basename(f).lower()
         if f.lower().endswith('.bil') and 
-            os.path.basename(f).lower().startswith(include_text.lower()) and
-            pattern.search(os.path.basename(f))
+            os.path.basename(f).lower().startswith(include_text.lower()) #and
+           # pattern.search(os.path.basename(f))
     ]
 
     if not files:
@@ -212,48 +216,57 @@ def stack_to_netcdf(root_dir,
 
 
 TASKS = [
+    dict(
+        root="/nfs/pancake/prism_current/us/an/ehdr/800m/ppt/daily/normals/",
+        years="NoYearDir",
+        var_name="ppt",
+        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/normals.nc",
+        include_text="prism_ppt",
+    )]
 
-    # y val paths (with radar)
-    dict(
-        root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
-        years=(2023,),
-        var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc",
-        include_text="adj_best_ppt",
-    ),
-    # y train paths (with radar)
-    dict(
-        root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
-        years=(2015, 2019),
-        var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc",
-        include_text="adj_best_ppt",
-    ),    
-    # x train paths (NO radar)
-    dict(
-        root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
-        years=(2015, 2019),
-        var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.nc",
-        include_text="cai_ppt",
-    ),
-    # x val paths (NO radar)
-    dict(
-        root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
-        years=(2023,),
-        var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc",
-        include_text="cai_ppt",
-    ),
-    # FOR INFERENCE ONLY: pre paths (NO radar; different year)
-    dict(
-        root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
-        years=(2024,),
-        var_name="ppt",
-        out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc",
-        include_text="cai_ppt",
-    ),
-]
+# TASKS = [
+
+#     # y val paths (with radar)
+#     dict(
+#         root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
+#         years=(2023,),
+#         var_name="ppt",
+#         out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc",
+#         include_text="adj_best_ppt",
+#     ),
+#     # y train paths (with radar)
+#     dict(
+#         root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
+#         years=(2015, 2019),
+#         var_name="ppt",
+#         out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc",
+#         include_text="adj_best_ppt",
+#     ),    
+#     # x train paths (NO radar)
+#     dict(
+#         root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
+#         years=(2015, 2019),
+#         var_name="ppt",
+#         out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.nc",
+#         include_text="cai_ppt",
+#     ),
+#     # x val paths (NO radar)
+#     dict(
+#         root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
+#         years=(2023,),
+#         var_name="ppt",
+#         out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc",
+#         include_text="cai_ppt",
+#     ),
+#     # FOR INFERENCE ONLY: pre paths (NO radar; different year)
+#     dict(
+#         root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
+#         years=(2024,),
+#         var_name="ppt",
+#         out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc",
+#         include_text="cai_ppt",
+#     ),
+# ]
 
 def _ensure_parent_dir(path: str):
     parent = os.path.dirname(os.path.abspath(path))
@@ -307,7 +320,7 @@ def run_all_stacks(tasks, parallel=True, n_workers=None):
 
 # ---- Toggle here ----
 if __name__ == "__main__":
-    PARALLEL = True
+    PARALLEL = False
     results = run_all_stacks(TASKS, parallel=PARALLEL, n_workers=len(TASKS))
     # Optional: summarize
     ok = sum(1 for _, success, _ in results if success)

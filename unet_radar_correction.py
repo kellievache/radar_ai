@@ -2,17 +2,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Jan 27 18:14:35 2026
-
-@author: vachek
+Convective morphology correction for PRISM (PyTorch).
+- DDP-stable training loop (fixed steps per epoch, syncs, broadcasts)
+- Zarr/NetCDF lazy reading with crop windows
+- Residual U-Net with texture-aware losses (HP, spectral, FSS)
 """
-
-
-# convective_correction_pytorch3.py
-# Full PyTorch pipeline for PRISM convective-morphology correction
-# with robust masking (-9999 & NaN), stable climatology, AMP, and safe I/O.
-# Author: (You)
-# Date: 2026-01-26
 
 import os
 import json
@@ -26,9 +20,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import datetime as _dt
-
+import torch.distributed as dist
+import time, random
 try:
     import xarray as xr  # NetCDF/Zarr I/O
 except ImportError:
@@ -39,31 +32,29 @@ try:
 except ImportError:
     tqdm = lambda x, **k: x
 
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data._utils.collate import default_collate
+from collections import OrderedDict
+import datetime as _dt
 
-# dataset_random_patches.py
-
-
-from torch.utils.data import Dataset
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
-
-
-
-# Silence noisy "Mean of empty slice" warnings globally (we handle empties explicitly)
+# Silence noisy "Mean of empty slice" warnings globally
 warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
 
-
 # ---------------------------
-# Reproducibility & utilities
+# DDP helpers
 # ---------------------------
-
 def ddp_is_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 def ddp_setup():
     """Initialize DDP if launched with torchrun."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl", init_method="env://")
+        import datetime as dt
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=dt.timedelta(minutes=30)
+        )
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         return local_rank, dist.get_rank(), dist.get_world_size()
@@ -74,9 +65,8 @@ def ddp_cleanup():
     if ddp_is_initialized():
         dist.destroy_process_group()
 
-
 def ddp_broadcast_scalar(val, device, dtype=torch.float32):
-    """Broadcast a Python scalar from rank 0 to all ranks and return it (on every rank)."""
+    """Broadcast a scalar from rank 0 to all ranks."""
     if not ddp_is_initialized():
         return val
     t = torch.tensor([val], device=device, dtype=dtype)
@@ -85,7 +75,9 @@ def ddp_broadcast_scalar(val, device, dtype=torch.float32):
         return int(t.item())
     return float(t.item())
 
-
+# ---------------------------
+# Reproducibility & utilities
+# ---------------------------
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -97,130 +89,83 @@ def set_seed(seed: int = 42):
         torch.set_float32_matmul_precision('high')
     except Exception:
         pass
-    
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-
-
 
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
-
-def to_device(t, device):
-    return t.to(device) if torch.is_tensor(t) else t
-
-
 def sanitize_cfg_dict(cfg_dict: dict) -> dict:
-    """
-    Keep only keys present in the current Config dataclass.
-    Makes checkpoints robust to config changes across versions.
-    """
+    """Keep only keys present in current Config schema."""
     try:
         valid = {f.name for f in fields(Config)}
         return {k: v for k, v in cfg_dict.items() if k in valid}
     except Exception:
         return cfg_dict or {}
 
-
 def valid_mask(arr: np.ndarray, sentinel: float = -9999.0) -> np.ndarray:
-    """
-    1 for valid (finite & not sentinel), 0 for missing; handles NaNs and -9999.
-    Works on (T,H,W) or (H,W). Returns float32.
-    """
+    """1 for valid (finite & not sentinel), 0 for missing."""
     m = np.isfinite(arr).astype(np.float32)
     m = np.where(arr == sentinel, 0.0, m).astype(np.float32)
     return m
 
+def apply_residual_gate_in_tr_space(X_tr: torch.Tensor,
+                                    delta_tr: torch.Tensor,
+                                    M: torch.Tensor,
+                                    c: float = 1.0,      # center in transform space; ~log1p(1 mm)
+                                    beta: float = 1.0,   # slope of the transition
+                                    alpha_bg: float = 1.0,  # background weight outside mask
+                                   ) -> torch.Tensor:
+    """
+    X_tr:   [B,1,H,W]   first channel of X in transform space
+    delta_tr: [B,1,H,W] residual predicted by the model (also in transform space)
+    M:      [B,1,H,W]   mask (1 valid; 0 invalid/outside domain)
+    Returns: Y_pred_tr in transform space
+    """
+    # Smooth, bounded gate in transform space
+    # higher X -> smaller residual; lower X -> larger residual allowed
+    residual_weight = torch.sigmoid(beta * (c - X_tr))
+    # Make it mask-aware: inside mask use the gate; outside mask allow full residual (or alpha_bg)
+    residual_weight = residual_weight * M + (1.0 - M) * alpha_bg
+    return X_tr + residual_weight * delta_tr
 
-def ensure_chw(t: torch.Tensor) -> torch.Tensor:
-    """Ensure tensor has shape [1,H,W] (accepts [H,W] or [1,H,W])."""
-    return t.unsqueeze(0) if t.dim() == 2 else t
-
-
-
-
+# ---------------------------
+# Zarr/NetCDF helpers
+# ---------------------------
 def _is_zarr_store(path: str) -> bool:
-    # Heuristics: endswith '.zarr' or contains consolidated metadata
     if path.endswith(".zarr"):
         return True
     if os.path.isdir(path) and os.path.exists(os.path.join(path, ".zmetadata")):
         return True
     return False
 
-# def open_multi_auto(paths: List[str], time_dim: str, prefer_chunks_time1: bool = True):
-#     """
-#     Open a list of paths that may be NetCDFs (.nc) or Zarr stores (.zarr).
-#     Returns an xarray.Dataset ready for lazy windowed reads.
-#     """
-#     if len(paths) == 1:
-#         p = paths[0]
-#         if _is_zarr_store(p):
-#             # consolidated=True speeds metadata; chunks here tell Dask how to index 'time'
-#             ds = xr.open_zarr(p, consolidated=True, chunks={time_dim: 1} if prefer_chunks_time1 else None)
-#         else:
-#             ds = xr.open_dataset(p, engine="netcdf4")
-#             # If you want to avoid chunk-splitting warnings on NetCDF,
-#             # you can choose to *not* set chunks here and rely on slicing in Dataset.
-#             # Or, if you know on-disk time chunk (e.g., 72), you can do:
-#             # ds = ds.chunk({time_dim: 72})
-#         return ds
-
-#     # Multiple paths: use open_mfdataset
-#     all_zarr = all(_is_zarr_store(p) for p in paths)
-#     if all_zarr:
-#         ds = xr.open_mfdataset(
-#             paths, engine="zarr", combine="by_coords",
-#             chunks={time_dim: 1} if prefer_chunks_time1 else None,
-#             backend_kwargs={"consolidated": True}
-#         )
-#     else:
-#         ds = xr.open_mfdataset(paths, engine="netcdf4", combine="by_coords")
-#         # Same comment as above: you may choose to .chunk({time_dim: <on-disk-time-chunk>})
-#         # if you want to avoid chunk-splitting warnings.
-#     return ds
-
-
 def open_multi_auto(paths: List[str], time_dim: str, prefer_chunks_time1: bool = True):
-    # prefer_chunks_time1 flag becomes NO-OP for Zarr to avoid splitting
+    """
+    Open paths that may be NetCDF (.nc) or Zarr (.zarr), returning an xarray.Dataset.
+    For Zarr we rely on native chunks to avoid splitting warnings.
+    """
     if len(paths) == 1:
         p = paths[0]
         if _is_zarr_store(p):
-            # ⬇️ REMOVE the chunks=... line to avoid splitting stored chunks
             return xr.open_zarr(p, consolidated=True)
         else:
             return xr.open_dataset(p, engine="netcdf4")
-
-    # Multi-path
     all_zarr = all(_is_zarr_store(p) for p in paths)
     if all_zarr:
         return xr.open_mfdataset(
-            paths,
-            engine="zarr",
-            combine="by_coords",
+            paths, engine="zarr", combine="by_coords",
             backend_kwargs={"consolidated": True}
-            # ⬆️ NO chunks= here either; use native chunking
         )
     else:
         return xr.open_mfdataset(paths, engine="netcdf4", combine="by_coords")
-
-
-
 
 # ---------------------------
 # Checkpoint helpers
 # ---------------------------
 def get_state_dict(model: nn.Module) -> dict:
-    """
-    Return a clean (non-DataParallel-prefixed) state dict.
-    """
     return model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
 
-
 def _expected_in_channels_from_state(state: dict) -> Optional[int]:
-    """
-    Inspect first conv weight to infer expected input channels in checkpoint.
-    """
     k = "inc.block.0.weight"
     if k not in state and ("module." + k) in state:
         k = "module." + k
@@ -231,14 +176,8 @@ def _expected_in_channels_from_state(state: dict) -> Optional[int]:
     except Exception:
         return None
 
-
 def load_weights_robust(model: nn.Module, ckpt_obj: dict) -> None:
-    """
-    Load a (possibly DataParallel) checkpoint into `model`, stripping 'module.' and
-    filtering out non-matching or missing keys to avoid runtime errors.
-    """
     state = ckpt_obj["model"] if isinstance(ckpt_obj, dict) and "model" in ckpt_obj else ckpt_obj
-    # strip 'module.' prefix if present
     state = {k.replace("module.", "", 1): v for k, v in state.items()}
     model_state = model.state_dict()
     filtered = {}
@@ -252,13 +191,13 @@ def load_weights_robust(model: nn.Module, ckpt_obj: dict) -> None:
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     print(f"[load_weights_robust] Loaded {len(filtered)}/{len(state)} tensors into model.")
     if missing:
-        print(f"[load_weights_robust] Missing (not found in ckpt): {len(missing)} keys (showing up to 10)")
+        print(f"[load_weights_robust] Missing (not in ckpt): {len(missing)} keys (showing up to 10)")
         for k in missing[:10]:
             print("  -", k)
         if len(missing) > 10:
             print("  ...")
     if unexpected:
-        print(f"[load_weights_robust] Unexpected (ignored in load): {len(unexpected)} keys (showing up to 10)")
+        print(f"[load_weights_robust] Unexpected (ignored): {len(unexpected)} keys (showing up to 10)")
         for k in unexpected[:10]:
             print("  -", k)
         if len(unexpected) > 10:
@@ -270,107 +209,108 @@ def load_weights_robust(model: nn.Module, ckpt_obj: dict) -> None:
         if len(skipped_shape) > 8:
             print("  ...")
 
-
 # ---------------------------
 # Config
 # ---------------------------
 @dataclass
 class Config:
     # Data
-    prism_train_paths: List[str] = None     # list of training NetCDF paths
+    prism_train_paths: List[str] = None
     prism_val_paths: List[str] = None
-    prism_var: str = "ppt"                  # variable name in NetCDF (e.g., 'ppt', 'precip')
-    static_dem_path: Optional[str] = None   # optional DEM NetCDF/Zarr
-    static_mask_path: Optional[str] = None  # optional external mask (1=valid)
+    prism_var: str = "ppt"
+    static_dem_path: Optional[str] = None
+    static_mask_path: Optional[str] = None
     lat_name: str = "lat"
     lon_name: str = "lon"
     time_name: str = "time"
+
     # Transform
-    transform: str = "log1p"                # 'log1p' | 'sqrt' | 'none'
-    # Degradation (emulate radar-off)
-    degrade_gauss_sigma_min: float = 0.8
-    degrade_gauss_sigma_max: float = 2.5
-    degrade_spectral_cutoff_min: float = 0.10  # fraction of Nyquist
-    degrade_spectral_cutoff_max: float = 0.35
-    degrade_intensity_damp_min: float = 0.85   # multiply field
+    transform: str = "log1p"  # 'log1p'|'sqrt'|'none'
+
+    # Degradation (emulate no-radar)
+    degrade_gauss_sigma_min: float = 1.0
+    degrade_gauss_sigma_max: float = 3.0
+    degrade_spectral_cutoff_min: float = 0.08
+    degrade_spectral_cutoff_max: float = 0.25
+    degrade_intensity_damp_min: float = 0.85
     degrade_intensity_damp_max: float = 0.98
-    degrade_additive_noise_std: float = 0.05   # on transformed space
+    degrade_additive_noise_std: float = 0.05
     apply_degrade_prob: float = 1.0
+
     # Training
     epochs: int = 50
     min_epochs: int = 10
-    batch_size: int = 4 #was 4, reduced to save memory.  Could be 1, but using torch.nn.dataparallel and so it has to be atleast 2 to reach 2 gpus.
+    batch_size: int = 8    # per-GPU in DDP
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
-    base_ch: int = 64 #was 64 reduced to save memory
-    num_workers: int = 2
+    base_ch: int = 96
+    num_workers: int = 8
     amp: bool = True
-    patience: int = 8
+    patience: int = 30
+
     # Loss weights
-    loss: str = "huber"                # 'l1' | 'huber'
-    w_grad: float = 0.1                # gradient loss
-    w_spec: float = 0.0                # spectral loss (0 -> disabled)
-    w_mass: float = 0.01               # mass preservation penalty
+    loss: str = "huber"     # 'l1'|'huber'
+    w_grad: float = 0.3
+    w_spec: float = 0.05
+    w_mass: float = 0.01
+    w_hp: float = 0.2
+    w_fss: float = 0.02
+
     # FSS thresholds (mm/day)
     fss_thresholds: List[float] = None
     fss_window: int = 9
+
     # Static features usage
-    use_dem: bool = False              # you haven't supplied one by default
-    use_mask: bool = False             # we build mask from data anyway
+    use_dem: bool = False
+    use_mask: bool = False
+
     # Tiling for inference
     tile: int = 512
-    tile_overlap: int = 32
+    tile_overlap: int = 192
+
     # Files
     out_dir: str = "/nfs/pancake/u5/projects/vachek/automate_qc/runs/convective_correction/"
-    #out_dir: str = "./runs/convective_correction"
     ckpt_name: str = "best.pt"
     seed: int = 42
     device: str = "cuda"
 
-    # Optional external X inputs.  These are non radar data. 
-    x_train_paths: List[str] = None   # list of NetCDF/Zarr for X (train); if None -> degrade Y
-    x_val_paths:   List[str] = None   # list of NetCDF/Zarr for X (val);   if None -> degrade Y
-    x_pre_paths:   List[str] = None   # list of NetCDF/Zarr for X during inference; if None -> degrade Y
-    x_var: Optional[str] = None       # variable name for X (defaults to prism_var if None)             Y is with radar and X is without radar
- 
+    # Optional external X
+    x_train_paths: List[str] = None
+    x_val_paths:   List[str] = None
+    x_pre_paths:   List[str] = None
+    x_var: Optional[str] = None
 
-    # --- Training from spatial crops ---
-    patch: int = 768                 # crop size H=W
-    train_crops_per_epoch: int = 20000   # synthetic length: how many random crops per epoch.  Multiple of 4
-    val_crop_mode: str = "random"    # 'random' or 'tile'
-    val_crops_per_epoch: int = 4000  # used when val_crop_mode == 'random'
-    val_tile: Optional[int] = None   # if None, default to cfg.tile
-    val_tile_overlap: Optional[int] = None  # if None, default to cfg.tile_overlap
+    # Training from spatial crops
+    patch: int = 768
+    train_crops_per_epoch: int = 20000
+    val_crop_mode: str = "random"
+    val_crops_per_epoch: int = 4000
+    val_tile: Optional[int] = None
+    val_tile_overlap: Optional[int] = None
 
-    degrade_in_dataset: bool = False  # new: do heavy ops in training step on GPU    
+    # Do heavy degr ops on GPU in train loop instead of dataset
+    degrade_in_dataset: bool = False
+
+    # NEW: time-slice cache size (planes per variable to keep per rank)
+    timeslice_cache: int = 3
     
+    domain_mask_npy: Optional[str] = None
+    climatology_npy: Optional[str] = None
     
-    patch = 768
-    base_ch = 96
-    batch_size: int = 8          
-    w_grad = 0.3
-    w_spec = 0.05
-    w_hp   = 0.2
-    w_fss  = 0.02
-    degrade_gauss_sigma_min = 1.0
-    degrade_gauss_sigma_max = 3.0
-    degrade_spectral_cutoff_min = 0.08
-    degrade_spectral_cutoff_max = 0.25
-    tile_overlap: int = 192
-    patience: int = 8
- 
-    # ...
+    gate_c: float = 1.4
+    gate_beta: float = 1.5
+    gate_alpha_bg: float = 1.0
+    
+
 
     def __post_init__(self):
         if self.fss_thresholds is None:
             self.fss_thresholds = [1.0, 5.0, 10.0, 20.0]
 
-
 # ---------------------------
 # Degradation ops
 # ---------------------------
 def gaussian_blur2d(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Separable Gaussian blur with reflect padding; x: [B,C,H,W]."""
     if sigma <= 0:
         return x
     radius = int(3 * sigma)
@@ -386,9 +326,7 @@ def gaussian_blur2d(x: torch.Tensor, sigma: float) -> torch.Tensor:
     x = F.conv2d(x, ky, groups=c)
     return x
 
-
 def spectral_lowpass(x: torch.Tensor, cutoff_frac: float) -> torch.Tensor:
-    """Circular low-pass in frequency domain; x: [B,C,H,W]."""
     if cutoff_frac >= 1.0:
         return x
     B, C, H, W = x.shape
@@ -399,14 +337,12 @@ def spectral_lowpass(x: torch.Tensor, cutoff_frac: float) -> torch.Tensor:
     R = torch.sqrt(KX**2 + KY**2)
     rmax = 0.5
     mask = (R <= (cutoff_frac * rmax)).float()
-    mask = mask.view(1, 1, H, W//2 + 1)
+    mask = mask.view(1, 1, H, W // 2 + 1)
     X_f = X * mask
     x_f = torch.fft.irfft2(X_f, s=(H, W), norm='ortho')
     return x_f
 
-
 def apply_degradation(y_mm: torch.Tensor, cfg: Config) -> torch.Tensor:
-    """Degrade in mm space; y_mm: [B,1,H,W]; returns [B,1,H,W]."""
     x = y_mm
     if random.random() <= cfg.apply_degrade_prob:
         sigma = random.uniform(cfg.degrade_gauss_sigma_min, cfg.degrade_gauss_sigma_max)
@@ -417,9 +353,7 @@ def apply_degradation(y_mm: torch.Tensor, cfg: Config) -> torch.Tensor:
         x = x * damp
     return torch.clamp(x, min=0.0)
 
-
 def highpass(z: torch.Tensor, sigma: float = 1.5) -> torch.Tensor:
-    # HP = identity - gaussian low-pass; z in transformed space
     return z - gaussian_blur2d(z, sigma)
 
 # ---------------------------
@@ -433,7 +367,6 @@ def mm_to_transform(mm: torch.Tensor, kind: str) -> torch.Tensor:
     else:
         return mm
 
-
 def transform_to_mm(z: torch.Tensor, kind: str) -> torch.Tensor:
     if kind == "log1p":
         return torch.expm1(z)
@@ -442,242 +375,42 @@ def transform_to_mm(z: torch.Tensor, kind: str) -> torch.Tensor:
     else:
         return z
 
-
 def add_noise_transformed(z: torch.Tensor, std: float) -> torch.Tensor:
     if std <= 0:
         return z
     return z + torch.randn_like(z) * std
 
+def _cuda_sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
-# ---------------------------
-# Dataset (random crops or deterministic tiles)
-# ---------------------------
-class PrismCropsDataset(Dataset):
-    """
-    Yields (X, Y, M) tensors for either random crops (training) or tiled windows (validation).
-
-    - Loads full Y (and optional X) into host RAM ONCE (as before), but only returns a small
-      HxW window per sample. GPU memory drops ~quadratically with patch size.
-    - Channels in X: [x_tr, (dem?) , mask, clim_tr]
-    - If no external X is provided, X is made by degrading Y (your radar-off emulation).
-
-    Modes:
-      * mode='train' -> random crops; __len__ = train_crops_per_epoch
-      * mode='val'   -> 'random' or 'tile' depending on cfg.val_crop_mode
-    """
-    def __init__(self,
-                 data_arrays: List[np.ndarray],           # list of [T_i,H,W] -> concat time
-                 static_dem: Optional[np.ndarray],
-                 static_mask: Optional[np.ndarray],
-                 transform: str,
-                 cfg: Config,
-                 x_arrays: Optional[List[np.ndarray]] = None,  # optional external X [T,H,W]
-                 mode: str = "train"):
-        super().__init__()
-        self.cfg = cfg
-        self.transform = transform
-        self.mode = mode
-
-        # --- Concatenate Y (targets) over time: [T,H,W]
-        self.Y = np.concatenate(data_arrays, axis=0).astype(np.float32)
-        self.T, self.H, self.W = self.Y.shape
-
-        # --- Optional external X aligned to Y
-        self.X = None
-        if x_arrays is not None:
-            Xcat = np.concatenate(x_arrays, axis=0).astype(np.float32)
-            if Xcat.shape != self.Y.shape:
-                raise ValueError(
-                    f"External X shape {Xcat.shape} does not match Y shape {self.Y.shape}. "
-                    "Ensure time/lat/lon alignment and identical grid."
-                )
-            self.X = Xcat
-
-        # --- Optional DEM / static mask
-        self.dem = None
-        if static_dem is not None and cfg.use_dem:
-            dem = static_dem.astype(np.float32)
-            dem = (dem - np.nanmean(dem)) / (np.nanstd(dem) + 1e-6)
-            dem = np.where(np.isfinite(dem), dem, 0.0)
-            self.dem = dem  # [H,W]
-
-        self.user_static_mask = None
-        if static_mask is not None and cfg.use_mask:
-            m = (static_mask > 0.5).astype(np.float32)
-            m = np.where(np.isfinite(m), m, 0.0)
-            self.user_static_mask = m  # [H,W]
-
-        # --- Domain mask from Y: valid at least once over time
-        mask_all = valid_mask(self.Y, sentinel=-9999.0).astype(np.float32)   # [T,H,W]
-        domain_mask = (np.nanmax(mask_all, axis=0) > 0.5).astype(np.float32) # [H,W]
-        self.domain_mask = domain_mask
-        print(f"[Dataset] Domain valid fraction: {float(domain_mask.mean()):.3f}")
-
-        # --- Climatology in mm (mean over time where valid)
-        Y_masked = np.where(mask_all > 0.5, self.Y, np.nan)
-        clim = np.nanmean(Y_masked, axis=0).astype(np.float32)  # [H,W]
-        empty = ~np.isfinite(clim)
-        if empty.any():
-            print(f"[Dataset] Climatology: {int(empty.sum())} pixels had no valid data; filled 0.")
-        clim = np.where(np.isfinite(clim), clim, 0.0)
-        self.clim = clim
-
-        # --- Crop window planning
-        self.patch = int(getattr(cfg, "patch", 256))
-        # Safety for small grids
-        self.patch_h = min(self.patch, self.H)
-        self.patch_w = min(self.patch, self.W)
-
-        if self.mode == "train":
-            # synthetic length controls steps/epoch
-            self.N = int(getattr(cfg, "train_crops_per_epoch", 20000))
-            self._sampler = self._random_sampler
+def _barrier(device):
+    if ddp_is_initialized():
+        if device.type == "cuda":
+            dist.barrier(device_ids=[device.index])
         else:
-            val_mode = getattr(cfg, "val_crop_mode", "random").lower()
-            if val_mode == "tile":
-                vt = cfg.val_tile or cfg.tile
-                vo = cfg.val_tile_overlap or cfg.tile_overlap
-                self.tile = int(vt)
-                self.tile_overlap = int(vo)
-                self._make_val_tiles()  # sets self.tiles = [(t, y0, x0, h, w), ...]
-                self.N = len(self.tiles)
-                self._sampler = self._tile_sampler
-                print(f"[ValTiles] {self.N} tiles (tile={self.tile}, overlap={self.tile_overlap})")
-            else:
-                self.N = int(getattr(cfg, "val_crops_per_epoch", 4000))
-                self._sampler = self._random_sampler
-
-        # RNGs
-        self._rng_py = random.Random(cfg.seed if self.mode == "train" else cfg.seed + 1)
-
-    # -------- samplers --------
-    def _random_sampler(self, idx: int) -> Tuple[int, int, int, int, int]:
-        t = self._rng_py.randrange(self.T)
-        y0 = self._rng_py.randrange(0, max(1, self.H - self.patch_h + 1))
-        x0 = self._rng_py.randrange(0, max(1, self.W - self.patch_w + 1))
-        return t, y0, x0, self.patch_h, self.patch_w
-
-    def _make_val_tiles(self):
-        step = self.tile - self.tile_overlap
-        tiles = []
-        for t in range(self.T):
-            for y0 in range(0, self.H, step):
-                for x0 in range(0, self.W, step):
-                    y1 = min(y0 + self.tile, self.H)
-                    x1 = min(x0 + self.tile, self.W)
-                    tiles.append((t, y0, x0, y1 - y0, x1 - x0))
-        self.tiles = tiles
-
-    def _tile_sampler(self, idx: int) -> Tuple[int, int, int, int, int]:
-        return self.tiles[idx]
-
-    # -------- helpers --------
-    def __len__(self) -> int:
-        return self.N
-
-    def _slice2d(self, arr2d: np.ndarray, y0: int, x0: int, h: int, w: int) -> np.ndarray:
-        return arr2d[y0:y0+h, x0:x0+w]
-
-    def _slice3d_t(self, arr3d: np.ndarray, t: int, y0: int, x0: int, h: int, w: int) -> np.ndarray:
-        return arr3d[t, y0:y0+h, x0:x0+w]
-
-    def __getitem__(self, idx: int):
-        # ---- pick window ----
-        t, y0, x0, h, w = self._sampler(idx)
-
-        # ---- Target y_mm crop & its mask ----
-        y_mm = self._slice3d_t(self.Y, t, y0, x0, h, w)   # [h,w]
-        m_data = valid_mask(y_mm, sentinel=-9999.0).astype(np.float32)   # [h,w]
-        m_dom  = self._slice2d(self.domain_mask, y0, x0, h, w)           # [h,w]
-        m = (m_data * m_dom).astype(np.float32)
-        if self.user_static_mask is not None:
-            m = (m * (self._slice2d(self.user_static_mask, y0, x0, h, w) > 0.5).astype(np.float32)).astype(np.float32)
-
-        # sanitize target
-        y_mm = np.where(m > 0.5, np.clip(y_mm, 0.0, 1e6), 0.0).astype(np.float32)
-        y_t  = torch.from_numpy(y_mm)[None, ...]  # [1,h,w]
-
-        # ---- Input X (external or degraded) in mm ----
-        if self.X is not None:
-            x_np = self._slice3d_t(self.X, t, y0, x0, h, w)
-            x_np = np.where(np.isfinite(x_np), x_np, 0.0).astype(np.float32)
-            x_np = np.where(m > 0.5, np.clip(x_np, 0.0, 1e6), 0.0)
-            x_mm = torch.from_numpy(x_np)[None, ...]  # [1,h,w]
-        else:
-            # degrade Y -> X (mm space)
-            #x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)  # [1,h,w]
-            #x_mm = x_mm * torch.from_numpy(m)[None, ...]
-            
-            # ⚠️ If we're doing degradation on GPU, just pass Y as X (in mm), no heavy ops here.
-            if not self.cfg.degrade_in_dataset:
-                x_mm = y_t.clone()  # [1,h,w], mm space, no blur/FFT on CPU
-            else:
-                # CPU-side degrade (only if explicitly requested)
-                x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)
-            x_mm = x_mm * torch.from_numpy(m)[None, ...]
-
-
-        # ---- transform to training space & add noise on input ----
-        y_tr = mm_to_transform(y_t, self.transform).float()
-        x_tr = mm_to_transform(x_mm, self.transform).float()
-        x_tr = add_noise_transformed(x_tr, self.cfg.degrade_additive_noise_std)
-        x_tr = x_tr * torch.from_numpy(m)[None, ...]
-
-        # ---- static channels: dem, mask, climatology (transformed) ----
-        chans = [x_tr]
-        if self.dem is not None:
-            chans.append(torch.from_numpy(self._slice2d(self.dem, y0, x0, h, w))[None, ...])
-        chans.append(torch.from_numpy(m)[None, ...])  # mask channel
-        clim_crop = self._slice2d(self.clim, y0, x0, h, w).astype(np.float32)
-        clim_tr = mm_to_transform(torch.from_numpy(clim_crop)[None, ...], self.transform)
-        clim_tr = clim_tr * torch.from_numpy(m)[None, ...]
-        chans.append(clim_tr)
-
-        X = torch.cat(chans, dim=0).float()            # [C,h,w]
-        Y = y_tr.float()                                # [1,h,w]
-        M = torch.from_numpy(m)[None, ...].float()      # [1,h,w]
-        return X, Y, M
-    
+            dist.barrier()
 
 # ---------------------------
-# Streaming random crops from NetCDF/Zarr via xarray+dask.  Loads partial input grids
+# Datasets
 # ---------------------------
 class XRRandomPatchDataset(Dataset):
     """
-    Random (or tiled) patches streamed from NetCDF/Zarr without preloading entire arrays.
-
-    - Y paths (with radar) are required.
-    - X paths (without radar) optional; if not provided, X is made by degrading Y.
-    - Builds domain_mask (any valid over time) and climatology as 2D arrays via dask compute.
-    - Channels: [x_tr, (dem?), mask, clim_tr] — identical to your training recipe.
+    Streaming random (or tiled) patches directly from NetCDF/Zarr.
+    Channels: [x_tr, (dem?), mask, clim_tr]
     """
-
-    def __init__(
-        self,
-        y_paths: List[str],
-        x_paths: Optional[List[str]],
-        cfg: Config,
-        mode: str = "train",
-    ):
+    def __init__(self, y_paths: List[str], x_paths: Optional[List[str]], cfg: Config, mode: str = "train"):
         super().__init__()
         assert xr is not None, "xarray is required."
-
         self.cfg = cfg
         self.mode = mode
-        self.patch = int(getattr(cfg, "patch", 256))
+        self.patch = int(getattr(cfg, "patch", 768))
         self.transform = cfg.transform
 
-        # Safer open (time-chunked) → pulls small windows; engine='netcdf4' helps on many systems.
-      #  self.ds_y = xr.open_mfdataset(
-      #      y_paths, combine="by_coords",
-      #      chunks={cfg.time_name: 1}, engine="netcdf4"
-      #  )
-      
+        # Open datasets
         self.ds_y = open_multi_auto(y_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
-
         self.var_y = cfg.prism_var
         self.t_dim = cfg.time_name
-        # Infer spatial dims from the variable dims (last two)
         v = self.ds_y[self.var_y]
         self.y_dim = v.dims[-2]
         self.x_dim = v.dims[-1]
@@ -685,32 +418,57 @@ class XRRandomPatchDataset(Dataset):
         self.H = int(self.ds_y.sizes[self.y_dim])
         self.W = int(self.ds_y.sizes[self.x_dim])
 
-        # Optional X
-     #   self.ds_x = None
-     #   if x_paths:
-     #       self.ds_x = xr.open_mfdataset(
-     #           x_paths, combine="by_coords",
-     #           chunks={cfg.time_name: 1}, engine="netcdf4"
-     #       )
-     #       self.var_x = cfg.x_var or cfg.prism_var
-
         if x_paths:
             self.ds_x = open_multi_auto(x_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
             self.var_x = cfg.x_var or cfg.prism_var
         else:
             self.ds_x = None
 
-        # Compute 2D domain mask (valid at least once) out-of-core
-        # This streams over time and keeps only [H,W] in memory at the end.
-        mask_any = self.ds_y[self.var_y].pipe(xr.ufuncs.isfinite).any(dim=self.t_dim)
-        self.domain_mask = mask_any.compute().astype(np.float32).values  # [H,W]
+        # Keep paths for reopen safety
+        self._y_paths = list(y_paths)
+        self._x_paths = list(x_paths) if x_paths else None
 
-        # Compute climatology (2D) out-of-core
-        clim = self.ds_y[self.var_y].where(xr.ufuncs.isfinite(self.ds_y[self.var_y])).mean(dim=self.t_dim)
-        clim = clim.fillna(0.0)
-        self.clim = clim.compute().astype(np.float32).values  # [H,W]
+        # -------- Domain mask & daily climatology --------
+        # domain mask
+        if getattr(cfg, "domain_mask_npy", None):
+            self.domain_mask = np.load(cfg.domain_mask_npy, mmap_mode="r").astype(np.float32)
+        else:
+            # Default: assume all valid (or compute from one slice if you prefer)
+            self.domain_mask = np.ones((self.H, self.W), dtype=np.float32)
+        
+        # daily climatology [366, H, W]
+        if getattr(cfg, "climatology_npy", None):
+            self.clim_daily = np.load(cfg.climatology_npy, mmap_mode="r")
+            if self.clim_daily.ndim != 3 or self.clim_daily.shape[0] != 366:
+                raise ValueError(
+                    f"climatology_npy must be [366,H,W], got {self.clim_daily.shape}"
+                )
+            if self.clim_daily.shape[1] != self.H or self.clim_daily.shape[2] != self.W:
+                raise ValueError(
+                    f"climatology_npy spatial shape {self.clim_daily.shape[1:]} "
+                    f"does not match data grid {(self.H, self.W)}"
+                )
+        else:
+            # If not provided, fall back to zeros (no prior)
+            self.clim_daily = np.zeros((366, self.H, self.W), dtype=np.float32)
+        
+        # Precompute day-of-year (0..365) for each time index t
+        try:
+            # xarray's dt access does not trigger a big compute; it's on the coord
+            doy = self.ds_y[self.t_dim].dt.dayofyear.values  # 1..366
+            self.doy_idx = (doy - 1).astype(np.int16)        # 0..365
+        except Exception:
+            # Fallback: assume first dimension is time-like and evenly maps to 0..365 mod 366
+            self.doy_idx = np.arange(self.T, dtype=np.int64) % 366
 
-        # Optional statics (small, OK to load)
+        # ---- Time-slice LRU cache (per rank) ----
+        self._cache_limit = int(getattr(cfg, "timeslice_cache", 3))
+        self._cache = {
+            "y": OrderedDict(),   # key: t -> np.ndarray[H, W] float32
+            "x": OrderedDict(),   # only used if self.ds_x is not None
+        }
+
+        # Statics
         self.dem = None
         if cfg.use_dem and cfg.static_dem_path:
             dem = load_static(cfg.static_dem_path)
@@ -727,7 +485,7 @@ class XRRandomPatchDataset(Dataset):
                 sm = np.where(np.isfinite(sm), sm, 0.0)
                 self.user_static_mask = sm.astype(np.float32)
 
-        # Length (synthetic) and sampler
+        # Length & sampler
         if mode == "train":
             self.N = int(getattr(cfg, "train_crops_per_epoch", 20000))
             self._sampler = self._random_sampler
@@ -744,6 +502,27 @@ class XRRandomPatchDataset(Dataset):
                 self.N = int(getattr(cfg, "val_crops_per_epoch", 4000))
                 self._sampler = self._random_sampler
                 self._rng = random.Random(cfg.seed + 1)
+
+    def reseed(self, base_seed: int, epoch: int, rank: int):
+        """Per-epoch, per-rank RNG reseed for crop sampling."""
+        self._rng = random.Random(int(base_seed + epoch * 997 + rank))
+
+    def reopen(self):
+        """Reopen xarray Datasets to refresh backend state at epoch boundaries."""
+        try:
+            self.ds_y.close()
+        except Exception:
+            pass
+        self.ds_y = open_multi_auto(self._y_paths, time_dim=self.cfg.time_name, prefer_chunks_time1=True)
+        if self._x_paths is not None:
+            try:
+                self.ds_x.close()
+            except Exception:
+                pass
+            self.ds_x = open_multi_auto(self._x_paths, time_dim=self.cfg.time_name, prefer_chunks_time1=True)
+        # Optional: clear caches here if you prefer strict per-epoch freshness
+        # self._cache["y"].clear()
+        # self._cache["x"].clear()
 
     def __len__(self):
         return self.N
@@ -778,194 +557,129 @@ class XRRandomPatchDataset(Dataset):
                 self.x_dim: slice(x0, x0 + w),
             }
         )
-        # Materialize only this small slice
-        return np.asarray(sl.load().data, dtype=np.float32)
+        # Force single-threaded dask compute to avoid cross-process threaded deadlocks
+        import dask
+        with dask.config.set(scheduler="single-threaded"):
+            arr = sl.compute().data
+        return np.asarray(arr, dtype=np.float32)
 
-    def __getitem__(self, idx):
+    def _get_plane(self, which: str, t: int) -> np.ndarray:
+        """
+        Return a full 2D plane (H, W) for the given time index `t`.
+        - which: 'y' or 'x'
+        - Uses an LRU cache per-rank. If miss, reads the full plane once (single-threaded).
+        """
+        assert which in ("y", "x")
+        cache = self._cache[which]
+        if t in cache:
+            arr = cache.pop(t)  # move to most-recent
+            cache[t] = arr
+            return arr
+
+        # Choose dataset & var
+        ds = self.ds_y if which == "y" else self.ds_x
+        if ds is None:
+            raise RuntimeError(f"_get_plane({which}, t={t}) requested but ds is None.")
+        var = self.var_y if which == "y" else self.var_x
+
+        # Lazily select the time slice
+        sl = ds[var].isel(**{self.t_dim: t})
+
+        # Robust: compute synchronously to avoid multi-process thread deadlocks on NFS
+        import dask
+        with dask.config.set(scheduler="single-threaded"):
+            # sl is a DataArray with dims (y_dim, x_dim)
+            arr = np.asarray(sl.compute().data, dtype=np.float32)  # [H, W]
+
+        # Insert into LRU and enforce size
+        cache[t] = arr
+        while len(cache) > self._cache_limit:
+            cache.popitem(last=False)  # drop least-recent
+        return arr
+
+    def __getitem__(self, idx: int):
+        # ---- pick window ----
         t, y0, x0, h, w = self._sampler(idx)
 
-        # --- Y patch (mm) and masks
-        y_mm = self._window(self.ds_y, self.var_y, t, y0, x0, h, w)   # [h,w]
+        # 1) Y plane -> Y crop
+        y_plane = self._get_plane("y", t)                  # [H, W]
+        if y_plane is None or not isinstance(y_plane, np.ndarray):
+            raise RuntimeError(f"y_plane is invalid at t={t}")
+        y_mm = y_plane[y0:y0+h, x0:x0+w]                   # [h, w]
+        if y_mm.size == 0:
+            raise RuntimeError(f"Empty Y crop at t={t}, y0={y0}, x0={x0}, h={h}, w={w}")
+
+        # 2) Masks from Y crop + domain mask
         m_data = valid_mask(y_mm, sentinel=-9999.0).astype(np.float32)
         m_dom  = self.domain_mask[y0:y0+h, x0:x0+w]
         m = (m_data * m_dom).astype(np.float32)
         if self.user_static_mask is not None:
             m = (m * (self.user_static_mask[y0:y0+h, x0:x0+w] > 0.5).astype(np.float32)).astype(np.float32)
 
+        # 3) Sanitize Y with mask
         y_mm = np.where(m > 0.5, np.clip(y_mm, 0.0, 1e6), 0.0).astype(np.float32)
-        y_t  = torch.from_numpy(y_mm)[None, ...]   # [1,h,w]
+        y_t  = torch.from_numpy(y_mm)[None, ...]                           # [1, h, w]
 
-        # --- X (mm): external or degrade(Y)
+        # 4) X crop (cached plane or degrade path) -> sanitize with m
         if self.ds_x is not None:
-            x_np = self._window(self.ds_x, self.var_x, t, y0, x0, h, w)
+            x_plane = self._get_plane("x", t)                              # [H, W]
+            if x_plane is None or not isinstance(x_plane, np.ndarray):
+                raise RuntimeError(f"x_plane is invalid at t={t}")
+            x_np = x_plane[y0:y0+h, x0:x0+w]                               # [h, w]
             x_np = np.where(np.isfinite(x_np), x_np, 0.0).astype(np.float32)
             x_np = np.where(m > 0.5, np.clip(x_np, 0.0, 1e6), 0.0)
-            x_mm = torch.from_numpy(x_np)[None, ...]
+            x_mm = torch.from_numpy(x_np)[None, ...]                       # [1, h, w]
         else:
-         #   x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)
-         #   x_mm = x_mm * torch.from_numpy(m)[None, ...]
-            
-            # ⚠️ If we're doing degradation on GPU, just pass Y as X (in mm), no heavy ops here.
+            # No external X: pass Y-as-X; if GPU degradation is desired, we do it in the train loop
             if not self.cfg.degrade_in_dataset:
-                x_mm = y_t.clone()  # [1,h,w], mm space, no blur/FFT on CPU
+                x_mm = y_t.clone()                                         # [1, h, w]
             else:
-                # CPU-side degrade (only if explicitly requested)
                 x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)
             x_mm = x_mm * torch.from_numpy(m)[None, ...]
 
-
-        # --- Transform space + small noise on input
+        # 5) Transform to training space + small input noise (keep invalid at zero)
         y_tr = mm_to_transform(y_t, self.transform).float()
         x_tr = mm_to_transform(x_mm, self.transform).float()
         x_tr = add_noise_transformed(x_tr, self.cfg.degrade_additive_noise_std)
         x_tr = x_tr * torch.from_numpy(m)[None, ...]
 
-        # --- Build channels
+        # 6) Assemble channels: [x_tr, (dem?), mask, clim_tr]
         chans = [x_tr]
         if self.dem is not None:
             chans.append(torch.from_numpy(self.dem[y0:y0+h, x0:x0+w])[None, ...])
         chans.append(torch.from_numpy(m)[None, ...])
 
-        clim_crop = self.clim[y0:y0+h, x0:x0+w].astype(np.float32)
-        clim_tr = mm_to_transform(torch.from_numpy(clim_crop)[None, ...], self.transform)
+        # Day-of-year slice from daily climatology
+        doy = int(self.doy_idx[t])  # 0..365
+        clim_crop = self.clim_daily[doy, y0:y0+h, x0:x0+w].astype(np.float32)      
+        clim_crop = np.where(np.isfinite(clim_crop), clim_crop, 0.0).astype(np.float32)# NEW: sanitize NaNs before transform
+
+        clim_tr = 0.1 * mm_to_transform(torch.from_numpy(clim_crop)[None, ...], self.transform)
+        # mask the climatology channel to zero outside domain/valid pixels
         clim_tr = clim_tr * torch.from_numpy(m)[None, ...]
         chans.append(clim_tr)
 
-        X = torch.cat(chans, dim=0).float()        # [C,h,w]
-        Y = y_tr.float()                            # [1,h,w]
-        M = torch.from_numpy(m)[None, ...].float()  # [1,h,w]
-        return X, Y, M
-    
+        X = torch.cat(chans, dim=0).float()                  # [C, h, w]
+        
+        # NEW: sanitize assembled X
+        X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-# ---------------------------
-# Dataset  Loads entire NetCDF input grids
-# ---------------------------
-class PrismDataset(torch.utils.data.Dataset):
-    """
-    Training dataset building (X, Y, M) pairs:
+        Y = y_tr.float()                                     # [1, h, w]
+        M = torch.from_numpy(m)[None, ...].float()           # [1, h, w]
 
-    - Uses valid_mask (NaN & -9999) to build per-sample mask
-    - Uses domain mask (valid-any-time) computed from Y to stabilize masks & climatology
-    - Adds mask channel to model inputs
-    - NEW: If x_arrays is provided, uses those as X (aligned [T,H,W]); otherwise X is built by degrading Y.
-    """
-    def __init__(self,
-                 data_arrays: List[np.ndarray],           # Y arrays: list of [T_i, H, W] -> concat on time
-                 static_dem: Optional[np.ndarray],
-                 static_mask: Optional[np.ndarray],
-                 transform: str,
-                 cfg: Config,
-                 x_arrays: Optional[List[np.ndarray]] = None # NEW: X arrays list (optional)
-                 ):
-        self.cfg = cfg
-        self.transform = transform
-
-        # Target Y (PRISM)
-        self.Y = np.concatenate(data_arrays, axis=0).astype(np.float32)  # [T,H,W]
-        self.T, self.H, self.W = self.Y.shape
-
-        # Optional external X
-        self.X = None
-        if x_arrays is not None:
-            Xcat = np.concatenate(x_arrays, axis=0).astype(np.float32)   # [T,H,W]
-            if Xcat.shape != self.Y.shape:
-                raise ValueError(
-                    f"External X shape {Xcat.shape} does not match Y shape {self.Y.shape}. "
-                    "Ensure time/lat/lon alignment and identical grid."
-                )
-            self.X = Xcat
-
-        # Optional DEM
-        self.dem = None
-        if static_dem is not None and cfg.use_dem:
-            dem = static_dem.astype(np.float32)
-            dem = (dem - np.nanmean(dem)) / (np.nanstd(dem) + 1e-6)
-            dem = np.where(np.isfinite(dem), dem, 0.0)
-            self.dem = dem
-
-        # Optional external static mask
-        self.mask = None
-        if static_mask is not None and cfg.use_mask:
-            m = (static_mask > 0.5).astype(np.float32)
-            m = np.where(np.isfinite(m), m, 0.0)
-            self.mask = m
-
-        # Build overall valid mask & domain mask (from Y)
-        mask_all = valid_mask(self.Y, sentinel=-9999.0).astype(np.float32)   # [T,H,W]
-        domain_mask = (np.nanmax(mask_all, axis=0) > 0.5).astype(np.float32) # [H,W]
-        self.domain_mask = domain_mask
-        print(f"[Dataset] Domain valid fraction (has data at least once): {float(domain_mask.mean()):.3f}")
-
-        # Climatology over valid pixels; fill never-valid with 0
-        Y_masked = np.where(mask_all > 0.5, self.Y, np.nan)
-        clim = np.nanmean(Y_masked, axis=0).astype(np.float32)
-        empty_cols = ~np.isfinite(clim)
-        if empty_cols.any():
-            print(f"[Dataset] Climatology: {int(empty_cols.sum())} pixels had no valid data; filled with 0.")
-        clim = np.where(np.isfinite(clim), clim, 0.0)
-        self.clim = clim
-
-    def __len__(self):
-        return self.T
-
-    def __getitem__(self, idx):
-        # --- Target (Y) and masks ---
-        y_mm = self.Y[idx]  # [H,W]
-
-        # Per-sample mask & intersect with domain mask (plus static mask if provided)
-        m_data = valid_mask(y_mm, sentinel=-9999.0).astype(np.float32)
-        m = (m_data * self.domain_mask).astype(np.float32)
-        if self.mask is not None:
-            m = (m * (self.mask > 0.5).astype(np.float32)).astype(np.float32)
-
-        # Sanitize target
-        y_mm_clean = np.where(m > 0.5, np.clip(y_mm, 0.0, 1e6), 0.0).astype(np.float32)
-        y_t = torch.from_numpy(y_mm_clean)[None, ...]  # [1,H,W]
-
-        # --- Input (X): external or degrade(Y) ---
-        if self.X is not None:
-            # Use external X supplied as NumPy array (already aligned)
-            x_np = self.X[idx]  # [H,W]
-            x_np = np.where(np.isfinite(x_np), x_np, 0.0).astype(np.float32)
-            x_np = np.where(m > 0.5, np.clip(x_np, 0.0, 1e6), 0.0)
-            x_mm = torch.from_numpy(x_np)[None, ...]  # [1,H,W]
-        else:
-            # Fallback: degrade Y to emulate radar-off characteristics
-            y_t_b = y_t.unsqueeze(0)  # [1,1,H,W]
-            x_mm = apply_degradation(y_t_b, self.cfg).squeeze(0)  # [1,H,W]
-            # Re-enforce mask boundary after filtering
-            x_mm = x_mm * torch.from_numpy(m)[None, ...]
-
-        # --- Transform and noise (keep invalid at zero) ---
-        y_tr = mm_to_transform(y_t, self.transform)
-        x_tr = mm_to_transform(x_mm, self.transform)
-        x_tr = add_noise_transformed(x_tr, self.cfg.degrade_additive_noise_std)
-        x_tr = x_tr * torch.from_numpy(m)[None, ...]
-
-        # --- Build input channels: [x_tr, dem?, mask, clim_tr(masked)] ---
-        chans = [x_tr]
-        if self.dem is not None:
-            chans.append(torch.from_numpy(self.dem)[None, ...])
-        chans.append(torch.from_numpy(m)[None, ...])  # mask channel
-
-        clim_tr = mm_to_transform(torch.from_numpy(self.clim)[None, ...], self.transform)
-        clim_tr = clim_tr * torch.from_numpy(m)[None, ...]
-        chans.append(clim_tr)
-
-        X = torch.cat(chans, dim=0).float()   # [C,H,W]
-        Y = y_tr.float()                      # [1,H,W]
-        M = torch.from_numpy(m)[None, ...].float()  # [1,H,W]
+        # Final sanity
+        if not (torch.is_tensor(X) and torch.is_tensor(Y) and torch.is_tensor(M)):
+            raise RuntimeError("Dataset produced non-tensor outputs")
         return X, Y, M
 
-
-
 # ---------------------------
-# Model: U-Net (residual head)
+# Model
 # ---------------------------
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, norm='batch', act='silu'):
         super().__init__()
-        Norm = nn.BatchNorm2d if norm == 'batch' else nn.InstanceNorm2d
+        #Norm = nn.BatchNorm2d if norm == 'batch' else nn.InstanceNorm2d
+        Norm = lambda ch: nn.GroupNorm(8, ch)
         Act = nn.SiLU if act == 'silu' else nn.ReLU
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
@@ -977,14 +691,12 @@ class ConvBlock(nn.Module):
         )
     def forward(self, x): return self.block(x)
 
-
 class Down(nn.Module):
     def __init__(self, in_ch, out_ch, **kw):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
         self.conv = ConvBlock(in_ch, out_ch, **kw)
     def forward(self, x): return self.conv(self.pool(x))
-
 
 class Up(nn.Module):
     def __init__(self, in_ch, out_ch, bilinear=True, **kw):
@@ -1004,18 +716,11 @@ class Up(nn.Module):
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
-
 class OutConv(nn.Module):
     def __init__(self, in_ch, out_ch): super().__init__(); self.conv = nn.Conv2d(in_ch, out_ch, 1)
     def forward(self, x): return self.conv(x)
 
-
 class ClimateUNet(nn.Module):
-    """
-    Residual U-Net on transformed space: predicts delta for channel-0 (x_tr).
-    Inputs: [x_tr, dem?, mask, clim_tr]
-    Output: delta_tr   (1 channel)
-    """
     def __init__(self, in_ch, base_ch=64, norm='batch', act='silu', bilinear=True):
         super().__init__()
         self.inc = ConvBlock(in_ch, base_ch, norm=norm, act=act)
@@ -1029,8 +734,7 @@ class ClimateUNet(nn.Module):
         self.up3 = Up(base_ch*4, base_ch*2 // factor, bilinear=bilinear, norm=norm, act=act)
         self.up4 = Up(base_ch*2, base_ch, bilinear=bilinear, norm=norm, act=act)
         self.outc = OutConv(base_ch, 1)
-
-    def forward(self, x):  # x: [B,C,H,W]
+    def forward(self, x):
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
@@ -1042,9 +746,8 @@ class ClimateUNet(nn.Module):
         x = self.up4(x,  x1)
         return self.outc(x)
 
-
 # ---------------------------
-# Losses & Metrics
+# Losses & metrics
 # ---------------------------
 def gradient_loss(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     def grads(z):
@@ -1061,16 +764,25 @@ def gradient_loss(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch
     return gx + gy
 
 
-def spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    B = pred.shape[0]
-    loss = 0.0
-    for b in range(B):
-        p = pred[b:b+1]; t = target[b:b+1]
-        P = torch.fft.rfft2(p, norm='ortho')
-        T = torch.fft.rfft2(t, norm='ortho')
-        loss += F.mse_loss(torch.abs(P), torch.abs(T))
-    return loss / max(B, 1)
+def spectral_loss(pred, target):
+    
+    # Upcast to float32 for FFT stability even under AMP
+    p32 = pred.float()
+    t32 = target.float()
 
+    P = torch.fft.rfft2(p32, norm='ortho')
+    T = torch.fft.rfft2(t32, norm='ortho')
+    return F.mse_loss(torch.abs(P), torch.abs(T))
+
+# def spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+#     B = pred.shape[0]
+#     loss = 0.0
+#     for b in range(B):
+#         p = pred[b:b+1]; t = target[b:b+1]
+#         P = torch.fft.rfft2(p, norm='ortho')
+#         T = torch.fft.rfft2(t, norm='ortho')
+#         loss += F.mse_loss(torch.abs(P), torch.abs(T))
+#     return loss / max(B, 1)
 
 def mass_preservation_penalty(pred_mm: torch.Tensor, target_mm: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     if mask is not None:
@@ -1081,14 +793,12 @@ def mass_preservation_penalty(pred_mm: torch.Tensor, target_mm: torch.Tensor, ma
         s_true = target_mm.sum(dim=(-1, -2))
     return F.l1_loss(s_pred, s_true)
 
-
 def rmse(pred, target, mask=None):
     if mask is not None:
         diff = (pred - target) * mask
         return torch.sqrt((diff**2).sum() / (mask.sum().clamp_min(1.0)))
     else:
         return torch.sqrt(F.mse_loss(pred, target))
-
 
 def mae(pred, target, mask=None):
     if mask is not None:
@@ -1097,64 +807,51 @@ def mae(pred, target, mask=None):
     else:
         return F.l1_loss(pred, target)
 
-
 def fss(pred_mm: torch.Tensor, target_mm: torch.Tensor, thr: float, window: int = 9, mask: Optional[torch.Tensor] = None):
     B, C, H, W = pred_mm.shape
     assert C == 1
     pad = window // 2
     k = torch.ones((1, 1, window, window), device=pred_mm.device) / (window * window)
-
     pred_bin = (pred_mm >= thr).float()
     targ_bin = (target_mm >= thr).float()
-
     pred_f = F.conv2d(F.pad(pred_bin, (pad, pad, pad, pad), mode='reflect'), k)
     targ_f = F.conv2d(F.pad(targ_bin, (pad, pad, pad, pad), mode='reflect'), k)
-
     num = (pred_f - targ_f) ** 2
     den = pred_f ** 2 + targ_f ** 2
-
     if mask is not None:
         m = F.max_pool2d(F.pad(mask, (pad, pad, pad, pad), mode='reflect'), window, stride=1)
         num = num * m
         den = den * m
-
     num = num.mean()
     den = den.mean().clamp_min(1e-6)
     return 1.0 - (num / den)
 
+def fss_loss(pred_mm, target_mm, thrs, window, mask):
+    vals = [1.0 - fss(pred_mm, target_mm, thr=t, window=window, mask=mask) for t in thrs]
+    return sum(vals) / max(len(vals), 1)
 
 # ---------------------------
-# Data loading helpers
+# Static loading
 # ---------------------------
-
 def load_arrays(paths: List[str], var: str, time_name: str) -> np.ndarray:
-    """
-    Load a list of NetCDF/Zarr files and concat over time -> [T,H,W]
-    """
     if xr is None:
         raise RuntimeError("xarray is required for NetCDF/Zarr loading.")
     arrs = []
     for p in paths:
-        ds = xr.open_dataset(p)
-        a = ds[var].load().values  # [T,H,W]
+        ds = xr.open_dataset(p, engine="netcdf4")
+        a = ds[var].load().values
         ds.close()
         if a.ndim != 3:
             raise ValueError(f"Variable '{var}' in {p} is not [T,H,W]. Got shape {a.shape}.")
         arrs.append(a.astype(np.float32))
     return np.concatenate(arrs, axis=0)
 
-def load_prism_arrays(paths: List[str], var: str, time_name: str) -> np.ndarray:
-    # Backward-compatible wrapper
-    return load_arrays(paths, var, time_name)
-
-
-
 def load_static(path: Optional[str], var_guess: Optional[str] = None) -> Optional[np.ndarray]:
     if path is None:
         return None
     if xr is None:
         raise RuntimeError("xarray is required to load static rasters.")
-    ds = xr.open_dataset(path)
+    ds = xr.open_dataset(path, engine="netcdf4")
     if var_guess is None:
         var_guess = list(ds.data_vars)[0]
     a = ds[var_guess].load().values
@@ -1163,24 +860,15 @@ def load_static(path: Optional[str], var_guess: Optional[str] = None) -> Optiona
         a = a[0]
     return a.astype(np.float32)
 
-
 # ---------------------------
-# BIL/HDR writing helpers
+# BIL/HDR writing
 # ---------------------------
-
 def _format_yyyymmdd(np_datetime) -> str:
-    """
-    Convert NumPy datetime (e.g., numpy.datetime64) to YYYYMMDD string.
-    """
     try:
-        # Try pandas-like conversion if available
-        # But to avoid extra deps, do a robust fallback
-        t = np.datetime_as_string(np_datetime, unit='D')  # 'YYYY-MM-DD'
+        t = np.datetime_as_string(np_datetime, unit='D')
         return t.replace('-', '')
     except Exception:
-        # Fallback via python datetime
         if isinstance(np_datetime, (np.datetime64, )):
-            # Convert to python datetime via astype
             ts = np_datetime.astype('datetime64[s]').astype('int')
             dt = _dt.datetime.utcfromtimestamp(int(ts))
             return dt.strftime('%Y%m%d')
@@ -1188,27 +876,14 @@ def _format_yyyymmdd(np_datetime) -> str:
             return np_datetime.strftime('%Y%m%d')
         else:
             s = str(np_datetime)
-            # Best effort: strip non-digits
             return ''.join(c for c in s if c.isdigit())[0:8]
 
-
-def _compose_bil_hdr(
-    nrows: int, ncols: int,
-    ulxmap: float, ulymap: float,
-    xdim: float, ydim: float,
-    nbands: int = 1,
-    nbits: int = 32,
-    nodata: float = -9999.0,
-    layout: str = "BIL",
-    byteorder: str = "I",     # I = Intel = little-endian
-    pixeltype: str = "FLOAT"
-) -> str:
-    """
-    Build ESRI .hdr content for a BIL file.
-    """
-    band_row_bytes = ncols * (nbits // 8) * nbands  # for NBANDS=1 this is ncols*4
-    total_row_bytes = band_row_bytes  # no padding
-
+def _compose_bil_hdr(nrows: int, ncols: int, ulxmap: float, ulymap: float,
+                     xdim: float, ydim: float, nbands: int = 1, nbits: int = 32,
+                     nodata: float = -9999.0, layout: str = "BIL",
+                     byteorder: str = "I", pixeltype: str = "FLOAT") -> str:
+    band_row_bytes = ncols * (nbits // 8) * nbands
+    total_row_bytes = band_row_bytes
     hdr = (
         f"BYTEORDER      {byteorder}\n"
         f"LAYOUT         {layout}\n"
@@ -1227,347 +902,66 @@ def _compose_bil_hdr(
     )
     return hdr
 
-
-def write_bil_pair(
-    arr2d: np.ndarray,
-    bil_path: str,
-    hdr_path: str,
-    ulxmap: float,
-    ulymap: float,
-    xdim: float,
-    ydim: float,
-    nodata: float = -9999.0,
-    force_little_endian: bool = True
-):
-    """
-    Write a single-band 2D array as ESRI BIL + HDR.
-    - arr2d: 2D numpy array [NROWS, NCOLS], north-up (row 0 = top row).
-    - Values written as float32, NaNs replaced with nodata.
-    """
+def write_bil_pair(arr2d: np.ndarray, bil_path: str, hdr_path: str,
+                   ulxmap: float, ulymap: float, xdim: float, ydim: float,
+                   nodata: float = -9999.0, force_little_endian: bool = True):
     if arr2d.ndim != 2:
         raise ValueError(f"write_bil_pair expects a 2D array, got shape {arr2d.shape}")
-
     nrows, ncols = arr2d.shape
-
-    # Replace NaNs with NODATA
     data = np.array(arr2d, dtype=np.float32, copy=True)
     data[~np.isfinite(data)] = nodata
-
-    # Ensure little-endian if requested (BYTEORDER I)
     if force_little_endian and data.dtype.byteorder not in ('<', '='):
         data = data.byteswap().newbyteorder('<')
-
-    # Write BIL (band interleaved by line). For single band, it's just row-major binary.
     with open(bil_path, 'wb') as f:
         data.tofile(f)
-
-    # Write HDR
-    hdr_txt = _compose_bil_hdr(
-        nrows=nrows, ncols=ncols,
-        ulxmap=ulxmap, ulymap=ulymap,
-        xdim=xdim, ydim=ydim,
-        nbands=1, nbits=32, nodata=nodata,
-        layout="BIL", byteorder="I", pixeltype="FLOAT"
-    )
+    hdr_txt = _compose_bil_hdr(nrows, ncols, ulxmap, ulymap, xdim, ydim,
+                               nbands=1, nbits=32, nodata=nodata,
+                               layout="BIL", byteorder="I", pixeltype="FLOAT")
     with open(hdr_path, 'w', encoding='ascii') as f:
         f.write(hdr_txt)
-
-
 
 # ---------------------------
 # Training
 # ---------------------------
-# def train(cfg: Config):
-#     set_seed(cfg.seed)
-#     #device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-    
-#     local_rank, global_rank, world_size = ddp_setup()
-#     if local_rank is not None:
-#         device = torch.device(f"cuda:{local_rank}")
-#         is_main = (global_rank == 0)
-#     else:
-#         device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-#         is_main = True
+def safe_collate(batch):
+    """Fail-fast collate to catch None or malformed dataset items during debugging."""
+    for i, item in enumerate(batch):
+        if item is None:
+            raise RuntimeError(f"[safe_collate] Dataset returned None at batch position {i}")
+        if not (isinstance(item, (list, tuple)) and len(item) == 3):
+            raise RuntimeError(f"[safe_collate] Bad item structure at pos {i}: type={type(item)}, item={item}")
+        X, Y, M = item
+        if not (torch.is_tensor(X) and torch.is_tensor(Y) and torch.is_tensor(M)):
+            raise RuntimeError(f"[safe_collate] Non-tensor at pos {i}: types=({type(X)}, {type(Y)}, {type(M)})")
+    return default_collate(batch)
 
-#     ensure_dir(cfg.out_dir)
-#     with open(os.path.join(cfg.out_dir, "config.json"), "w") as f:
-#         json.dump(asdict(cfg), f, indent=2)
-
-#     # Load Y.  These work with the full netcdf files.  Can cause OOM with multiple year training
-#     # Y_train = load_prism_arrays(cfg.prism_train_paths, cfg.prism_var, cfg.time_name)
-#     # Y_val   = load_prism_arrays(cfg.prism_val_paths,   cfg.prism_var, cfg.time_name)
-
-#     # # Optionally load X (external; else None -> degrade Y)
-#     # x_var_name = cfg.x_var or cfg.prism_var
-#     # X_train = load_arrays(cfg.x_train_paths, x_var_name, cfg.time_name) if cfg.x_train_paths else None
-#     # X_val   = load_arrays(cfg.x_val_paths,   x_var_name, cfg.time_name) if cfg.x_val_paths   else None
-
-#     # Statics
-#     static_dem  = load_static(cfg.static_dem_path) if cfg.use_dem else None
-#     static_mask = load_static(cfg.static_mask_path) if cfg.use_mask else None
-#     if static_mask is not None:
-#         static_mask = (static_mask > 0.5).astype(np.float32)
-
-#     # Datasets (crop - unaware)
-#     # ds_tr = PrismDataset([Y_train], static_dem, static_mask, cfg.transform, cfg, x_arrays=[X_train] if X_train is not None else None)
-#     # ds_va = PrismDataset([Y_val],   static_dem, static_mask, cfg.transform, cfg, x_arrays=[X_val]   if X_val   is not None else None)
-
-#     # dl_tr = torch.utils.data.DataLoader(
-#     #     ds_tr, batch_size=cfg.batch_size, shuffle=True,
-#     #     num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
-#     #     persistent_workers=(cfg.num_workers > 0), prefetch_factor=2
-#     # )
-#     # dl_va = torch.utils.data.DataLoader(
-#     #     ds_va, batch_size=cfg.batch_size, shuffle=False,
-#     #     num_workers=cfg.num_workers, pin_memory=True,
-#     #     persistent_workers=(cfg.num_workers > 0), prefetch_factor=2
-#     # )
-
-#     # Datasets (crop-aware)
-#     # ds_tr = PrismCropsDataset(
-#     #     [Y_train], static_dem, static_mask,
-#     #     cfg.transform, cfg,
-#     #     x_arrays=[X_train] if X_train is not None else None,
-#     #     mode="train"
-#     # )
-#     # ds_va = PrismCropsDataset(
-#     #     [Y_val], static_dem, static_mask,
-#     #     cfg.transform, cfg,
-#     #     x_arrays=[X_val] if X_val is not None else None,
-#     #     mode="val"
-#     # )
-
-#     # dl_tr = torch.utils.data.DataLoader(
-#     #     ds_tr,
-#     #     batch_size=cfg.batch_size, shuffle=False,   # randomness comes from dataset's sampler
-#     #     num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
-#     #     persistent_workers=(cfg.num_workers > 0), prefetch_factor=2 if cfg.num_workers > 0 else None
-#     # )
-#     # dl_va = torch.utils.data.DataLoader(
-#     #     ds_va,
-#     #     batch_size=cfg.batch_size, shuffle=False,
-#     #     num_workers=min(2, cfg.num_workers), pin_memory=True,
-#     #     persistent_workers=(cfg.num_workers > 0), prefetch_factor=2 if cfg.num_workers > 0 else None
-#     # )
-
-#     # ✨ NEW: streaming datasets (no full-array preload)
-#     ds_tr = XRRandomPatchDataset(
-#         y_paths=cfg.prism_train_paths,
-#         x_paths=cfg.x_train_paths,
-#         cfg=cfg,
-#         mode="train",
-#     )
-#     ds_va = XRRandomPatchDataset(
-#         y_paths=cfg.prism_val_paths,
-#         x_paths=cfg.x_val_paths,
-#         cfg=cfg,
-#         mode="val",
-#     )
-
-#     # Build loaders — start SAFE to verify no “Killed”
-#     dl_tr = torch.utils.data.DataLoader(
-#         ds_tr,
-#         batch_size=cfg.batch_size,
-#         shuffle=False,                 # randomness comes from dataset sampler
-#         num_workers=0,                 # 🔴 start with 0 to avoid forking copies
-#         pin_memory=True,
-#         drop_last=True,
-#         persistent_workers=False,
-#     )
-#     dl_va = torch.utils.data.DataLoader(
-#         ds_va,
-#         batch_size=cfg.batch_size,
-#         shuffle=False,
-#         num_workers=0,                 # 🔴 start with 0
-#         pin_memory=True,
-#         persistent_workers=False,
-#     )
-
-#     # Model
-#     sample_x, _, _ = ds_tr[0]
-#     in_ch = sample_x.shape[0]
-#    # model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
-   
-#     model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
-#     model = model.to(memory_format=torch.channels_last)  # <-- add this line
-
-#     print(f"Model params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    
-#    # if torch.cuda.device_count() > 1:
-#    #     model = torch.nn.DataParallel(model)
-
-#     if ddp_is_initialized():
-#         model = torch.nn.parallel.DistributedDataParallel(
-#             model, device_ids=[device.index], output_device=device.index,
-#             find_unused_parameters=False  # keeps comms lean
-#         )
-
-
-#     # Optimizer & AMP
-#     # opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-#     # try:
-#     #     scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp and device.type == "cuda")
-#     #     def autocast_cm(): return torch.autocast('cuda', enabled=cfg.amp and device.type == "cuda")
-#     # except Exception:
-#     #     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and device.type == "cuda")
-#     #     def autocast_cm(): return torch.cuda.amp.autocast(enabled=cfg.amp and device.type == "cuda")
-
-#     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    
-#     # Use bf16 on H100s; typically no scaler needed for bf16
-#     def autocast_cm():
-#         return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(cfg.amp and device.type == "cuda"))
-    
-#     scaler = None  # not used with bf16
-
-#     # LR scheduler on plateau (no verbose to support older torch)
-#     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#         opt, mode='min', factor=0.5, patience=4, threshold=1e-5
-#     )
-
-#     # Early stopping & checkpoints
-#     best_val = float('inf'); best_epoch = -1; patience_ctr = 0
-#     ckpt_best = os.path.join(cfg.out_dir, cfg.ckpt_name)
-#     ckpt_last = os.path.join(cfg.out_dir, "last.pt")
-
-#     for epoch in range(1, cfg.epochs + 1):
-#         model.train()
-#         tr_losses = []
-#         pbar = tqdm(dl_tr, desc=f"Epoch {epoch}/{cfg.epochs} [train]")
-#         for X, Y_true, M in pbar:
-#            # X = to_device(X, device); Y_true = to_device(Y_true, device); M = to_device(M, device)
-           
-#             X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-#             Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-#             M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-
-#             opt.zero_grad(set_to_none=True)
-            
-
-#             # If no external X and we disabled dataset-side degradation, do it here on GPU.
-#             if (cfg.x_train_paths is None) and (not cfg.degrade_in_dataset):
-#                 with torch.no_grad():
-#                     # Channel-0 currently holds x in *mm* (from dataset). Convert, degrade, and put back as transformed.
-#                    # x_mm = X[:, 0:1]                                  # [B,1,H,W] mm
-#                    # x_mm = torch.clamp(x_mm, min=0.0)
-#                    # x_mm = apply_degradation(x_mm, cfg)               # blur/FFT/damp on GPU
-#                    # x_tr = mm_to_transform(x_mm, cfg.transform)       # transformed for the model
-#                    # X = torch.cat([x_tr, X[:, 1:]], dim=1)            # replace channel-0
-
-            
-#                     # channel-0 is transformed; invert to mm, degrade, then re-transform
-#                     x_mm = transform_to_mm(X[:, 0:1], cfg.transform)
-#                     x_mm = torch.clamp(x_mm, min=0.0)
-#                     x_mm = apply_degradation(x_mm, cfg)
-#                     x_tr = mm_to_transform(x_mm, cfg.transform)
-#                     X = torch.cat([x_tr, X[:, 1:]], dim=1)
-            
-#             with autocast_cm():
-#                 delta = model(X)
-#                 Y_pred_tr = X[:, 0:1] + delta
-#                 # Data loss (masked)
-#                 if cfg.loss == "huber":
-#                     data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
-#                 else:
-#                     data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
-#                 # Gradient & mm penalties
-#                 gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
-#                 Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
-#                 Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
-#                 spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
-#                 mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-#                 loss = data_loss + gl + spec + mass
-
-#             #scaler.scale(loss).backward()
-#             #scaler.step(opt)
-#             #scaler.update()
-            
-#             loss.backward()
-#             opt.step()
-
-#             tr_losses.append(loss.item())
-#             pbar.set_postfix(loss=np.mean(tr_losses))
-
-#         # Validation
-#         model.eval()
-#         va_losses, va_rmse, va_mae = [], [], []
-#         fss_scores: Dict[float, List[float]] = {thr: [] for thr in cfg.fss_thresholds}
-#         with torch.no_grad():
-#             for X, Y_true, M in tqdm(dl_va, desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
-#               #  X = to_device(X, device); Y_true = to_device(Y_true, device); M = to_device(M, device)
-              
-#                 X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-#                 Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-#                 M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-
-#                 Y_pred_tr = X[:, 0:1] + model(X)
-#                 if cfg.loss == "huber":
-#                     data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
-#                 else:
-#                     data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
-#                 gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
-#                 Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
-#                 Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
-#                 spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
-#                 mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-#                 vloss = data_loss + gl + spec + mass
-#                 va_losses.append(vloss.item())
-#                 va_rmse.append(rmse(Y_pred_mm, Y_true_mm, mask=M).item())
-#                 va_mae.append(mae(Y_pred_mm, Y_true_mm, mask=M).item())
-#                 for thr in cfg.fss_thresholds:
-#                     fss_scores[thr].append(
-#                         fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
-#                     )
-
-#         mean_val = float(np.mean(va_losses)) if len(va_losses) else float('inf')
-#         mean_rmse = float(np.mean(va_rmse)) if len(va_rmse) else float('inf')
-#         mean_mae = float(np.mean(va_mae)) if len(va_mae) else float('inf')
-#         mean_fss = {thr: float(np.mean(v)) for thr, v in fss_scores.items()}
-#         print(f"[Val] loss={mean_val:.4f} rmse={mean_rmse:.3f} mae={mean_mae:.3f} "
-#               + " ".join([f"FSS@{thr}={mean_fss[thr]:.3f}" for thr in cfg.fss_thresholds]))
-
-#         # Scheduler
-#         if np.isfinite(mean_val):
-#             scheduler.step(mean_val)
-
-#         # Save "last" (ensure we don't keep 'module.' prefixes to simplify inference)
-#         _sd = get_state_dict(model)
-#         payload = {"model": _sd, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}
-#         torch.save(payload, ckpt_last)
-
-#         # Save "best" if improved
-#         improved = np.isfinite(mean_val) and (mean_val < best_val - 1e-5)
-#         if improved:
-#             best_val = mean_val; best_epoch = epoch; patience_ctr = 0
-#             # Refresh payload with latest state dict in case DataParallel changes
-#             payload = {"model": get_state_dict(model), "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}
-#             torch.save(payload, ckpt_best)
-#             print("  ↳ Saved new best checkpoint:", os.path.abspath(ckpt_best))
-#         else:
-#             patience_ctr += 1
-
-#         # Early stop after min_epochs
-#         if epoch >= cfg.min_epochs and patience_ctr >= cfg.patience:
-#             print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch} (val={best_val:.6f})")
-#             break
-
-#     print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best))
 
 
 def train(cfg: Config):
     import torch.multiprocessing as mp
-    mp.set_start_method("spawn", force=True)            # safer with NetCDF workers
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+    import dask
+    mp.set_start_method("spawn", force=True)
+
+    # Recommended stability knobs (you can also put these in your launcher)
+
+        
+    # Process-wide single-threaded dask (reduces cross-process hiccups)
+    try:
+        dask.config.set(scheduler="single-threaded")
+    except Exception:
+        pass
+    try:
+        if xr is not None:
+            xr.set_options(file_cache_maxsize=0)
+    except Exception:
+        pass
 
     set_seed(cfg.seed)
     ensure_dir(cfg.out_dir)
     with open(os.path.join(cfg.out_dir, "config.json"), "w") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    # -----------------------------
-    # DDP setup & device
-    # -----------------------------
+    # --- DDP setup & device ---
     local_rank, global_rank, world_size = ddp_setup()
     if local_rank is not None:
         device = torch.device(f"cuda:{local_rank}")
@@ -1575,122 +969,210 @@ def train(cfg: Config):
     else:
         device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         is_main = True
+        
+    if is_main:
+        print(f"[train] out_dir     : {os.path.abspath(cfg.out_dir)}")
+        print(f"[train] ckpt_best   : {os.path.join(cfg.out_dir, cfg.ckpt_name)}")
+        print(f"[train] ckpt_last   : {os.path.join(cfg.out_dir, 'last.pt')}")
+        
+    # --- helpers ---
+    def rlog(msg: str):
+        x=8
+       # print(f"[rank{global_rank}] {msg}", flush=True)
 
-    # -----------------------------
-    # Build streaming datasets
-    # -----------------------------
-    ds_tr = XRRandomPatchDataset(
-        y_paths=cfg.prism_train_paths,
-        x_paths=cfg.x_train_paths,
-        cfg=cfg,
-        mode="train",
-    )
-    ds_va = XRRandomPatchDataset(
-        y_paths=cfg.prism_val_paths,
-        x_paths=cfg.x_val_paths,
-        cfg=cfg,
-        mode="val",
-    )
-
-    # DistributedSampler for training
+    # CPU/Gloo group for coarse rendezvous (does not touch CUDA streams)
+    cpu_pg = None
     if ddp_is_initialized():
-        train_sampler = DistributedSampler(
-            ds_tr, num_replicas=world_size, rank=global_rank,
-            shuffle=False, drop_last=True
-        )
-    else:
-        train_sampler = None
+        cpu_pg = dist.new_group(backend="gloo")
 
-    # -----------------------------
-    # DataLoaders
-    # -----------------------------
-    from torch.utils.data import DataLoader
+    def cpu_barrier():
+        if cpu_pg is not None:
+            dist.barrier(group=cpu_pg)
 
+    def _cuda_sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    # NCCL barrier helper (use *only* for the tight sync before first fwd/bwd)
+    def _barrier_nccl():
+        if ddp_is_initialized():
+            if device.type == "cuda":
+                dist.barrier(device_ids=[device.index])
+            else:
+                dist.barrier()
+
+    # Sync LRs from rank-0 after stepping scheduler
+    def sync_lrs_from_rank0(optimizer):
+        if not ddp_is_initialized():
+            return
+        for pg in optimizer.param_groups:
+            lr_t = torch.tensor([pg['lr']], device=device)
+            dist.broadcast(lr_t, src=0)
+            pg['lr'] = float(lr_t.item())
+
+    # --- Datasets ---
+    ds_tr = XRRandomPatchDataset(y_paths=cfg.prism_train_paths,
+                                 x_paths=cfg.x_train_paths, cfg=cfg, mode="train")
+    ds_va = None  # created only on rank-0
+
+    # --- DataLoaders ---
     dl_tr = DataLoader(
         ds_tr,
-        batch_size=cfg.batch_size,             # per-GPU if DDP
-        sampler=train_sampler,
-        shuffle=False,                         # randomness from dataset/sampler
-        num_workers=8,                         # after stability: 8 for train
+        batch_size=cfg.batch_size,
+        sampler=None,
+        shuffle=False,
+        num_workers=8,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True,
-        prefetch_factor=4,
+        persistent_workers=False,
+        prefetch_factor=None,
+        collate_fn=safe_collate
     )
 
     dl_va = None
     if is_main:
+        ds_va = XRRandomPatchDataset(y_paths=cfg.prism_val_paths,
+                                     x_paths=cfg.x_val_paths, cfg=cfg, mode="val")
         dl_va = DataLoader(
             ds_va,
             batch_size=cfg.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=8,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2,
+            persistent_workers=False,
+            collate_fn=safe_collate
         )
 
-    # -----------------------------
-    # Model
-    # -----------------------------
-    sample_x, _, _ = ds_tr[0]
-    in_ch = sample_x.shape[0]
+    # --- Model ---
+    has_dem = (cfg.use_dem and getattr(ds_tr, "dem", None) is not None)
+    in_ch = 1 + (1 if has_dem else 0) + 1 + 1
 
     model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
-    model = model.to(memory_format=torch.channels_last)
+    
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+    
+    model = model.to("cuda")
 
-    # DDP wrap (instead of DataParallel)
+    #model = model.to(memory_format=torch.channels_last)
+
     if ddp_is_initialized():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[device.index], output_device=device.index,
-            find_unused_parameters=False
+            find_unused_parameters=False, gradient_as_bucket_view=True
         )
 
-    # Optimizer + bf16 autocast (no scaler)
+    # --- Optimizer & Scheduler & AMP ---
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+
     def autocast_cm():
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16,
                               enabled=(cfg.amp and device.type == "cuda"))
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode='min', factor=0.5, patience=4, threshold=1e-5
+        opt, mode='min', factor=0.5, patience=30, threshold=1e-5
     )
 
     best_val = float('inf'); best_epoch = -1; patience_ctr = 0
     ckpt_best = os.path.join(cfg.out_dir, cfg.ckpt_name)
     ckpt_last = os.path.join(cfg.out_dir, "last.pt")
 
-    # -----------------------------
-    # Epoch loop
-    # -----------------------------
+    # Steps per epoch (lock-step)
+    world = world_size if ddp_is_initialized() else 1
+    per_rank_bs = cfg.batch_size
+    expected_steps = ds_tr.N // (per_rank_bs * world)
+ #   if is_main:
+ #       print(f"[DDP] ds_tr.N={ds_tr.N}, world={world}, per-rank bs={per_rank_bs}, expected_steps={expected_steps}", flush=True)
 
-    # -----------------------------
-    # Epoch loop (DDP safe, no `break`)
-    # -----------------------------
     epoch = 1
     stop_training = False
-    
+
     while (epoch <= cfg.epochs) and (not stop_training):
-        # If using DistributedSampler, reseed per-epoch
-        if ddp_is_initialized() and isinstance(dl_tr.sampler, DistributedSampler):
-            dl_tr.sampler.set_epoch(epoch)
-    
-        # ----------------- TRAIN -----------------
+        # --- Epoch header (light warm-up) ---
+        _cuda_sync(); cpu_barrier()
+
+        if hasattr(ds_tr, "reseed"):
+            ds_tr.reseed(cfg.seed, epoch, global_rank)
+
+        time.sleep(0.25 * (global_rank if ddp_is_initialized() else 0))
+        if is_main:
+            tw = 0
+            _ = ds_tr._get_plane("y", tw)
+            if ds_tr.ds_x is not None:
+                _ = ds_tr._get_plane("x", tw)
+        _cuda_sync(); cpu_barrier()
+
+        # ============================
+        # TRAIN
+        # ============================
         model.train()
         running = 0.0
         log_every = 50
-    
-        pbar_iter = tqdm(dl_tr, desc=f"Epoch {epoch}/{cfg.epochs} [train]") if is_main else dl_tr
-    
-        for step, (X, Y_true, M) in enumerate(pbar_iter, 1):
-            # Move to CUDA & channels_last
+
+        it_tr = iter(dl_tr)
+
+        # ---- Prefetch STEP 0 ----
+        try:
+            X0, Y0, M0 = next(it_tr)
+        except StopIteration:
+            raise RuntimeError(f"Rank {global_rank}: no first batch for epoch {epoch}")
+
+        X0 = X0.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        Y0 = Y0.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        M0 = M0.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+
+        if (cfg.x_train_paths is None) and (not cfg.degrade_in_dataset):
+            with torch.no_grad():
+                x_mm = transform_to_mm(X0[:, 0:1], cfg.transform)
+                x_mm = torch.clamp(x_mm, min=0.0)
+                x_mm = apply_degradation(x_mm, cfg)
+                x_tr = mm_to_transform(x_mm, cfg.transform)
+                X0 = torch.cat([x_tr, X0[:, 1:]], dim=1)
+
+        opt.zero_grad(set_to_none=True)
+
+        with autocast_cm():
+            delta0 = model(X0)
+            Y0_pred_tr = apply_residual_gate_in_tr_space(
+                X_tr=X0[:, 0:1], delta_tr=delta0, M=M0,
+                c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+            )
+
+            if cfg.loss == "huber":
+                data_loss0 = F.smooth_l1_loss(Y0_pred_tr * M0, Y0 * M0)
+            else:
+                data_loss0 = F.l1_loss(Y0_pred_tr * M0, Y0 * M0)
+
+            gl0   = gradient_loss(Y0_pred_tr, Y0, mask=M0) * cfg.w_grad
+            Y0mm  = transform_to_mm(Y0_pred_tr, cfg.transform)
+            T0mm  = transform_to_mm(Y0,         cfg.transform)
+            spec0 = spectral_loss(Y0_pred_tr, Y0) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+            mass0 = mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+            hp0   = F.l1_loss(highpass(Y0_pred_tr, 1.5) * M0, highpass(Y0, 1.5) * M0) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+            fssl0 = fss_loss(Y0mm, T0mm, cfg.fss_thresholds, cfg.fss_window, M0) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+            loss0 = data_loss0 + gl0 + spec0 + mass0 + hp0 + fssl0
+            lambda_res = 0.01
+            loss0 = loss0 + lambda_res * (delta0 ** 2).mean()
+        loss0.backward()
+        opt.step()
+        running += float(loss0.detach())
+
+        steps_iter = tqdm(range(1, expected_steps), total=expected_steps, initial=1,
+                          desc=f"Epoch {epoch}/{cfg.epochs} [train]") if is_main else range(1, expected_steps)
+
+        for step in steps_iter:
+            try:
+                X, Y_true, M = next(it_tr)
+            except StopIteration:
+                raise RuntimeError(f"Rank {global_rank}: StopIteration at step {step}/{expected_steps} "
+                                   f"(N={ds_tr.N}, world={world}, bs={per_rank_bs})")
+
             X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
             Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
             M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-    
+
             opt.zero_grad(set_to_none=True)
-    
-            # Optional on-GPU degradation (when no external X and dataset didn't degrade)
+
             if (cfg.x_train_paths is None) and (not cfg.degrade_in_dataset):
                 with torch.no_grad():
                     x_mm = transform_to_mm(X[:, 0:1], cfg.transform)
@@ -1698,54 +1180,95 @@ def train(cfg: Config):
                     x_mm = apply_degradation(x_mm, cfg)
                     x_tr = mm_to_transform(x_mm, cfg.transform)
                     X = torch.cat([x_tr, X[:, 1:]], dim=1)
-    
+
             with autocast_cm():
                 delta = model(X)
-                Y_pred_tr = X[:, 0:1] + delta
-    
-                if cfg.loss == "huber":
-                    data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
-                else:
-                    data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
-    
-                gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
-                Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
-                Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
-                spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
-                mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-                loss = data_loss + gl + spec + mass
-    
+                Y_pred_tr = apply_residual_gate_in_tr_space(
+                    X_tr=X[:, 0:1], delta_tr=delta, M=M,
+                    c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                )
+
+
+            if cfg.loss == "huber":
+                data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
+            else:
+                data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+
+            gl   = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+            Y_pred_tr_clamped = Y_pred_tr.clamp(min=0.0, max=12.0)  # 12 ~ expm1(12) ≈ 1.6e5 mm;
+            Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform)
+            Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
+            spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+            mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+            hp_pred = highpass(Y_pred_tr, sigma=1.5)
+            hp_true = highpass(Y_true,    sigma=1.5)
+            hp   = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+            fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+            loss = data_loss + gl + spec + mass + hp + fssl
+
+
+            lambda_res = 0.01  # tune 1e-3..1e-2
+            loss = loss + lambda_res * (delta ** 2).mean()
+
             loss.backward()
             opt.step()
-    
-            # Throttled logging to avoid GPU sync every step
+
             running += float(loss.detach())
-            if is_main and (step % log_every == 0) and hasattr(pbar_iter, "set_postfix"):
-                pbar_iter.set_postfix(loss=running / log_every)
+            if is_main and (isinstance(steps_iter, tqdm)) and (step % log_every == 0):
+                steps_iter.set_postfix(loss=running / log_every)
                 running = 0.0
-    
-        # -------------- VALIDATION (rank 0 computes) --------------
-        if is_main:
+
+        del it_tr
+
+        # --- Pre-validation rendezvous (all ranks) ---
+     #   rlog(f"E{epoch}: pre-val barrier ENTER")
+        _cuda_sync(); cpu_barrier()
+     #   rlog(f"E{epoch}: pre-val barrier EXIT")
+
+        # ============================
+        # VALIDATION (rank 0 only)
+        # ============================
+        if is_main and dl_va is not None:
             model.eval()
+           # print(f"[rank{global_rank}] E{epoch}: starting validation", flush=True)
+
             va_losses, va_rmse, va_mae = [], [], []
             fss_scores: Dict[float, List[float]] = {thr: [] for thr in cfg.fss_thresholds}
-            with torch.no_grad():
+            skipped_empty = 0
+
+            with torch.no_grad(), autocast_cm():
                 for X, Y_true, M in tqdm(dl_va, desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
                     X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                     Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                     M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-    
-                    Y_pred_tr = X[:, 0:1] + model(X)
+
+                    if M.sum() <= 0:
+                        skipped_empty += 1
+                        continue
+                    delta_val = model(X)
+                    Y_pred_tr = apply_residual_gate_in_tr_space(
+                        X_tr=X[:, 0:1], delta_tr=delta_val, M=M,
+                        c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                    )
                     if cfg.loss == "huber":
                         data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
                     else:
                         data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+
                     gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
                     Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
                     Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
-                    spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+                    Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
+                    Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    spec = spectral_loss(Y_pred_tr * M, Y_true * M) * cfg.w_spec if cfg.w_spec > 0 else 0.0
                     mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-                    vloss = data_loss + gl + spec + mass
+                    hp_pred = highpass(Y_pred_tr, sigma=1.5)
+                    hp_true = highpass(Y_true,    sigma=1.5)
+                    hp = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                    fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+
+                    vloss = data_loss + gl + spec + mass + hp + fssl
                     va_losses.append(float(vloss.detach()))
                     va_rmse.append(rmse(Y_pred_mm, Y_true_mm, mask=M).item())
                     va_mae.append(mae(Y_pred_mm, Y_true_mm, mask=M).item())
@@ -1753,76 +1276,111 @@ def train(cfg: Config):
                         fss_scores[thr].append(
                             fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
                         )
-            mean_val = float(np.mean(va_losses)) if len(va_losses) else float('inf')
-            mean_rmse = float(np.mean(va_rmse)) if len(va_rmse) else float('inf')
-            mean_mae  = float(np.mean(va_mae))  if len(va_mae)  else float('inf')
-            mean_fss  = {thr: float(np.mean(v)) for thr, v in fss_scores.items()}
-            print(f"[Val] loss={mean_val:.4f} rmse={mean_rmse:.3f} mae={mean_mae:.3f} "
-                  + " ".join([f"FSS@{thr}={mean_fss[thr]:.3f}" for thr in cfg.fss_thresholds]))
+
+            print(f"[Val] skipped {skipped_empty} empty-mask batches", flush=True)
+
+            if len(va_losses) == 0:
+                mean_val  = float('inf')
+                mean_rmse = float('inf')
+                mean_mae  = float('inf')
+                mean_fss  = {thr: 0.0 for thr in cfg.fss_thresholds}
+                print(f"[Val] WARNING: all validation batches skipped (empty mask).", flush=True)
+            else:
+                mean_val  = float(np.mean(va_losses))
+                mean_rmse = float(np.mean(va_rmse))
+                mean_mae  = float(np.mean(va_mae))
+                mean_fss  = {thr: float(np.mean(v)) for thr, v in fss_scores.items()}
+
+            print(
+                f"[Val] loss={mean_val:.4f} rmse={mean_rmse:.3f} mae={mean_mae:.3f} "
+                + " ".join([f"FSS@{thr}={mean_fss[thr]:.3f}" for thr in cfg.fss_thresholds]),
+                flush=True
+            )
         else:
             mean_val = float('inf')
-    
-        # --- Broadcast mean_val so EVERY rank steps the scheduler the same way
-        mean_val = ddp_broadcast_scalar(mean_val, device, torch.float32)
-        scheduler.step(mean_val)
-    
-        # --- Rank 0 computes improved & early-stop flags, then broadcast to all ranks
+
+
+        if is_main:
+            # Step LR scheduler with validation metric
+            scheduler.step(mean_val)
+            # Broadcast LR to all ranks so they match rank-0
+            sync_lrs_from_rank0(opt)
+
+
+        # --- Pre-validation rendezvous (all ranks) ---
+   #     rlog(f"E{epoch}: pre-val barrier ENTER")
+        _cuda_sync(); cpu_barrier()
+    #    rlog(f"E{epoch}: pre-val barrier EXIT")
+        
+        # --- Validation (rank 0 only) ---
+        if is_main and dl_va is not None:
+            model.eval()
+           # print(f"[rank{global_rank}] E{epoch}: starting validation", flush=True)
+            # validation loop (with empty-mask guard, masked spectral, nan_to_num)...
+        
+        # --- Post-validation rendezvous (all ranks) ---
+   #     rlog(f"E{epoch}: post-val barrier ENTER")
+        _cuda_sync(); cpu_barrier()
+   #     rlog(f"E{epoch}: post-val barrier EXIT")
+
+
+        # Compute flags on rank-0; broadcast to all
         if is_main:
             improved_flag = int(np.isfinite(mean_val) and (mean_val < best_val - 1e-5))
+            planned_best_val = float(min(best_val, mean_val))
             should_stop_flag = int(epoch >= cfg.min_epochs and patience_ctr >= cfg.patience)
         else:
             improved_flag = 0
+            planned_best_val = best_val
             should_stop_flag = 0
-    
+
+   #     rlog(f"E{epoch}: broadcast flags ENTER")
         improved_flag    = ddp_broadcast_scalar(improved_flag,    device, torch.int32)
+        planned_best_val = ddp_broadcast_scalar(planned_best_val, device, torch.float32)
         should_stop_flag = ddp_broadcast_scalar(should_stop_flag, device, torch.int32)
-    
-        # --- Save only on rank 0 if improved; update patience only on rank 0
+        rlog(f"E{epoch}: broadcast flags EXIT")
+
+        # Checkpoint rank-0 only
         if is_main:
-            # Save "last" (optional)
+   #         rlog(f"E{epoch}: checkpoint SAVE ENTER")
             state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-            torch.save({"model": state_dict, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val},
-                       os.path.join(cfg.out_dir, "last.pt"))
-    
+            torch.save({"model": state_dict, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}, ckpt_last)
             if improved_flag:
-                best_val = mean_val
+                best_val = planned_best_val
                 best_epoch = epoch
                 patience_ctr = 0
-                torch.save({"model": state_dict, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val},
-                           os.path.join(cfg.out_dir, cfg.ckpt_name))
+                torch.save({"model": state_dict, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}, ckpt_best)
+                print("  ↳ Saved new best checkpoint:", os.path.abspath(ckpt_best), flush=True)
             else:
                 patience_ctr += 1
-    
-        # --- Barrier so all processes finish the epoch together
-        if ddp_is_initialized():
-            dist.barrier()
-    
-        # --- Early stop decision INSIDE the loop, but without `break`
+       #     rlog(f"E{epoch}: checkpoint SAVE EXIT")
+
+        # End-of-epoch rendezvous (all ranks)
+     #   rlog(f"E{epoch}: end-of-epoch barrier ENTER")
+        _cuda_sync(); cpu_barrier()
+     #   rlog(f"E{epoch}: end-of-epoch barrier EXIT")
+
+        # Early stop / epoch++
         if should_stop_flag:
             if is_main:
-                print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch} (val={best_val:.6f})")
+                print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch} (val={best_val:.6f})", flush=True)
             stop_training = True
-    
-        epoch += 1  # advance loop guard
-    
-    # Final sync before cleanup (avoid NCCL teardown races)
-    if ddp_is_initialized():
-        dist.barrier()
-    
-        if ddp_is_initialized():
-            dist.barrier()
+        else:
+            epoch += 1
+            if is_main:
+                rlog(f"ADVANCING TO E{epoch}")
 
+    # Final sync & cleanup
+    _cuda_sync(); cpu_barrier()
     if is_main:
-        print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best))
+        print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best), flush=True)
     ddp_cleanup()
 
+
 # ---------------------------
-# Inference
+# Inference (single-process by default)
 # ---------------------------
-def tile_infer(model: nn.Module, X: torch.Tensor, tile: int, overlap: int) -> torch.Tensor:
-    """
-    X: [1,C,H,W] on device; returns Y_pred_tr = X_tr + delta
-    """
+def tile_infer(cfg: Config, model: nn.Module, X: torch.Tensor, M: torch.Tensor, tile: int, overlap: int) -> torch.Tensor:
     device = X.device
     _, C, H, W = X.shape
     out = torch.zeros((1, 1, H, W), device=device)
@@ -1833,117 +1391,106 @@ def tile_infer(model: nn.Module, X: torch.Tensor, tile: int, overlap: int) -> to
             y1 = min(y0 + tile, H); x1 = min(x0 + tile, W)
             ys = slice(y0, y1); xs = slice(x0, x1)
             patch = X[..., ys, xs]
+            
+            M_p = M[..., ys, xs]                      # slice true mask
             with torch.no_grad():
                 delta = model(patch)
-                y_patch = patch[:, 0:1] + delta
+                y_patch = apply_residual_gate_in_tr_space(
+                    X_tr=patch[:, 0:1], delta_tr=delta, M=M_p,
+                    c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                )
+
             out[..., ys, xs] += y_patch
             weight[..., ys, xs] += 1.0
     out = out / weight.clamp_min(1.0)
     return out
 
-
-def infer_on_stack(cfg: Config,
-                   ckpt_path: str,
-                   pre_paths: List[str],           # Y files
-                   out_path: str,
-                   static_dem_path: Optional[str] = None,
-                   static_mask_path: Optional[str] = None):
-    """
-    Apply trained model to pre-2001 PRISM.
-    NOTE: Training always included a mask channel (per-sample, stabilized with a domain mask),
-    so inference must also include a mask channel regardless of model_cfg.use_mask.
-    """
+def infer_on_stack(cfg: Config, ckpt_path: str, pre_paths: List[str], out_path: str,
+                   static_dem_path: Optional[str] = None, static_mask_path: Optional[str] = None):
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(ckpt_path, map_location=device)
-    model_cfg = Config(**ckpt["cfg"])
+    model_cfg = Config(**sanitize_cfg_dict(ckpt["cfg"]))
 
     if xr is None:
         raise RuntimeError("xarray required for inference I/O.")
 
-    # ---- Load entire pre stack once (compute domain mask and climatology) ----
+    # Read stack(s) used for mask/clim/time axis
     arrs = []
     times_all = []
     for p in pre_paths:
-        ds = xr.open_dataset(p)
-        a = ds[model_cfg.prism_var].load()  # DataArray [time, lat, lon]
+        ds = xr.open_dataset(p, engine="netcdf4")
+        a = ds[model_cfg.prism_var].load()
         arrs.append(a.values.astype(np.float32))
         times_all.append(ds[model_cfg.time_name].values)
         ds.close()
 
-    pre_all = np.concatenate(arrs, axis=0)  # [T,H,W]
-
-    # Discover grid from the first file
-    ds0 = xr.open_dataset(pre_paths[0])
+    pre_all = np.concatenate(arrs, axis=0)
+    ds0 = xr.open_dataset(pre_paths[0], engine="netcdf4")
     H = ds0.sizes[model_cfg.lat_name]; W = ds0.sizes[model_cfg.lon_name]
-    lat = ds0[model_cfg.lat_name]; lon = ds0[model_cfg.lon_name]
     ds0.close()
 
-    # ---- DEM (optional; not used in your case but kept for completeness) ----
     dem = load_static(static_dem_path) if model_cfg.use_dem else None
 
-    # ---- Domain mask (valid at least once) & per-frame masks will use it ----
-    domain_mask = np.isfinite(pre_all).any(axis=0).astype(np.float32)  # [H,W]
+    # --- Load daily climatology and domain mask ---
+    clim_daily = None
+    if getattr(cfg, "climatology_npy", None):
+        clim_daily = np.load(cfg.climatology_npy, mmap_mode="r")
+        if clim_daily.ndim != 3 or clim_daily.shape[0] != 366:
+            raise ValueError(f"climatology_npy must be [366,H,W], got {clim_daily.shape}")
+    
+    domain_mask = None
+    if getattr(cfg, "domain_mask_npy", None):
+        domain_mask = np.load(cfg.domain_mask_npy, mmap_mode="r").astype(np.float32)
 
-    # ---- Climatology (mm) and transformed ----
-    clim = np.nanmean(np.where(np.isfinite(pre_all), pre_all, np.nan), axis=0).astype(np.float32)
-    clim = np.where(np.isfinite(clim), clim, 0.0)
-    clim_t = mm_to_transform(torch.from_numpy(clim)[None, ...].float(), model_cfg.transform).to(device)
+    # If not provided, derive domain mask from daily climatology; else from pre_all (fallback)
+    if domain_mask is None:
+        if clim_daily is not None:
+            domain_mask = np.isfinite(clim_daily).any(axis=0).astype(np.float32)  # [H,W]
+        else:
+            domain_mask = np.isfinite(pre_all).any(axis=0).astype(np.float32)     # fallback
+    
+    # We will build clim_tr PER-TIME (by DOY) below, so no global clim_t her
 
-    # ---- Build model with correct channel count (ALWAYS include mask channel) ----
-    # Channels: x_tr (1) + (dem?0/1) + mask (1) + clim_tr (1)
     chans = 1 + (1 if dem is not None else 0) + 1 + 1
     model = ClimateUNet(in_ch=chans, base_ch=model_cfg.base_ch).to(device)
-
-    # Check expected in_ch from checkpoint vs constructed
     _state = ckpt["model"] if "model" in ckpt else ckpt
     _exp_in = _expected_in_channels_from_state(_state)
     if _exp_in is not None and _exp_in != chans:
-        raise RuntimeError(
-            f"Checkpoint expects in_ch={_exp_in}, but inference constructed in_ch={chans}. "
-            f"This code now always includes a mask channel to match training; if your checkpoint truly "
-            f"was trained differently, verify the Dataset channel recipe."
-        )
-
-    # Robust load of weights (handles DataParallel 'module.' prefix)
+        raise RuntimeError(f"Checkpoint expects in_ch={_exp_in}, but inference constructed in_ch={chans}.")
     load_weights_robust(model, ckpt)
     model.eval()
 
     out_times = []
     out_days = []
 
-    # Optional X files for inference (pairwise with pre_paths)
     x_files = cfg.x_pre_paths if cfg.x_pre_paths else None
     if x_files is not None and len(x_files) != len(pre_paths):
-        raise ValueError("--x_pre_paths must have the same number of files as --pre_paths (pairwise).")
+        raise ValueError("--x_pre_paths must match --pre_paths length.")
 
     for i, p in enumerate(pre_paths):
-        dsY = xr.open_dataset(p)
-        y_mm_np = dsY[model_cfg.prism_var].load().values  # [T,H,W]
+        dsY = xr.open_dataset(p, engine="netcdf4")
+        y_mm_np = dsY[model_cfg.prism_var].load().values
         times = dsY[model_cfg.time_name].values
         dsY.close()
 
-        # Optional: load X for this chunk
         x_mm_np = None
         if x_files is not None:
-            dsX = xr.open_dataset(x_files[i])
+            dsX = xr.open_dataset(x_files[i], engine="netcdf4")
             xvar = model_cfg.x_var or model_cfg.prism_var
-            x_mm_np = dsX[xvar].load().values  # [T,H,W]
+            x_mm_np = dsX[xvar].load().values
             dsX.close()
             if x_mm_np.shape != y_mm_np.shape:
-                raise ValueError(f"X shape {x_mm_np.shape} does not match Y shape {y_mm_np.shape} for files:\n"
-                                 f"Y={p}\nX={x_files[i]}")
+                raise ValueError(f"X shape {x_mm_np.shape} != Y shape {y_mm_np.shape}")
 
         T = y_mm_np.shape[0]
         corrected = np.zeros_like(y_mm_np, dtype=np.float32)
 
         for t in tqdm(range(T), desc=os.path.basename(p)):
-            # Prepare Y[t] as baseline for constructing per-frame mask and (if needed) degradation
             y_mm = y_mm_np[t]
             y_mm = np.where(np.isfinite(y_mm), y_mm, 0.0).astype(np.float32)
             y_mm = np.clip(y_mm, 0.0, 1e5)
-            y_t = torch.from_numpy(y_mm)[None, None, ...].to(device)  # [1,1,H,W]
+            y_t = torch.from_numpy(y_mm)[None, None, ...].to(device)
 
-            # Prepare X[t]: either supplied or degrade(Y[t])
             if x_mm_np is not None:
                 x_mm = x_mm_np[t]
                 x_mm = np.where(np.isfinite(x_mm), x_mm, 0.0).astype(np.float32)
@@ -1951,280 +1498,201 @@ def infer_on_stack(cfg: Config,
                 x_tr = mm_to_transform(torch.from_numpy(x_mm)[None, None, ...].float().to(device),
                                        model_cfg.transform)
             else:
-                x_mm = apply_degradation(y_t, model_cfg)  # [1,1,H,W]
+                x_mm = apply_degradation(y_t, model_cfg)
                 x_tr = mm_to_transform(x_mm, model_cfg.transform)
+            
+           # m_data = (np.isfinite(y_mm)).astype(np.float32)
+            m_data = valid_mask(y_mm, sentinel=-9999.0)
+            m = (m_data * domain_mask).astype(np.float32)
+            mask_t = torch.from_numpy(m)[None, None, ...].to(device)
+            x_tr = x_tr * mask_t
+            # Build daily climatology channel for this time (by DOY)
+            # We need a day-of-year index 0..365 from the 'times' coordinate
+            try:
+                # times is a numpy datetime64 array from xarray, shape [T]
+                doy_t = int(np.datetime64(times[t], 'D').astype('datetime64[D]').astype(object).timetuple().tm_yday) - 1
+            except Exception:
+                # More robust: use xarray accessor on the slice (cheap)
+                doy_t = int(xr.DataArray(times[t]).dt.dayofyear.values) - 1
+            
+            if clim_daily is not None:
+                clim_crop = clim_daily[doy_t, :, :].astype(np.float32)
+            else:
+                # Fallback: zero clim if none provided
+                clim_crop = np.zeros((H, W), dtype=np.float32)
 
-            # --- Per-frame mask channel (matches training recipe) ---
-            # m_data from current y_mm; intersect with domain_mask (stabilizes holes over time)
-            m_data = (np.isfinite(y_mm)).astype(np.float32)
-            m = (m_data * domain_mask).astype(np.float32)  # [H,W]
-            mask_t = torch.from_numpy(m)[None, None, ...].to(device)  # [1,1,H,W]
+            # NEW: sanitize
+            clim_crop = np.where(np.isfinite(clim_crop), clim_crop, 0.0).astype(np.float32)
 
-            # Build channels: [x_tr, (dem?), mask, clim_t]
-            chans_list = [x_tr.squeeze(0)]  # [1,H,W]
+            clim_tr = 0.1 * mm_to_transform(
+                torch.from_numpy(clim_crop)[None, ...].float(),
+                model_cfg.transform
+            ).to(device)
+
+            clim_tr = clim_tr * mask_t
+ 
+            # Assemble channels
+            chans_list = [x_tr.squeeze(0)]
             if dem is not None:
                 dem_n = (dem - np.nanmean(dem)) / (np.nanstd(dem) + 1e-6)
                 dem_n = np.where(np.isnan(dem_n), 0.0, dem_n)
                 chans_list.append(torch.from_numpy(dem_n)[None, ...].to(device))
-            chans_list.append(mask_t.squeeze(0))  # [1,H,W]
-            chans_list.append(clim_t.to(device))
-            X = torch.cat(chans_list, dim=0).unsqueeze(0)  # [1,C,H,W]
+            chans_list.append(mask_t.squeeze(0))
+            chans_list.append(clim_tr.squeeze(0).to(device))
+            X = torch.cat(chans_list, dim=0).unsqueeze(0)
 
-            # Predict (tile or full)
             if max(H, W) > model_cfg.tile:
-                y_pred_tr = tile_infer(model, X, tile=model_cfg.tile, overlap=model_cfg.tile_overlap)
+                y_pred_tr = tile_infer(cfg, model, X, mask_t, tile=model_cfg.tile, overlap=model_cfg.tile_overlap)
             else:
+
                 with torch.no_grad():
                     delta = model(X)
-                    y_pred_tr = X[:, 0:1] + delta
-
-            # Back to mm
+                    # You already computed mask_t earlier (shape [1,1,H,W])
+                    y_pred_tr = apply_residual_gate_in_tr_space(
+                        X_tr=X[:, 0:1], delta_tr=delta, M=mask_t,
+                        c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                    )
             y_pred_mm = transform_to_mm(y_pred_tr, model_cfg.transform)
             y_pred_mm = torch.clamp(y_pred_mm, min=0.0)
+            y_pred_mm = y_pred_mm * mask_t
 
-            # Optional mass preservation vs. original Y (masked area)
-            s_pred = (y_pred_mm * mask_t).sum()
-            s_true = (y_t * mask_t).sum()
-            scale = (s_true / s_pred.clamp_min(1e-6)).item()
-            scale = np.clip(scale, 0.8, 1.25)
-            scale = 1
+            # Mass rescale disabled by default here (scale=1.0)
+            scale = 1.0
             y_pred_mm = y_pred_mm * scale
-
             corrected[t] = y_pred_mm.squeeze().detach().cpu().numpy()
 
         out_times.append(times)
         out_days.append(corrected)
-    
-        netcdf_out=False
-       
-        if netcdf_out:
-           Tall = np.concatenate(out_days, axis=0)
-           times_all = np.concatenate(out_times, axis=0)
-           ds_out = xr.Dataset({cfg.prism_var: (("time", "lat", "lon"), Tall)},
-                               coords={"time": times_all})
-           ds_ref = xr.open_dataset(pre_paths[0])
-           ds_out = ds_out.assign_coords(lat=ds_ref[cfg.lat_name], lon=ds_ref[cfg.lon_name])
-           ds_ref.close()
-           ensure_dir(os.path.dirname(out_path))
-           ds_out.to_netcdf(out_path)
-           print(f"Wrote corrected dataset → {out_path}")
-        else:     
-           Tall = np.concatenate(out_days, axis=0)        # [T,H,W] float32
-           times_all = np.concatenate(out_times, axis=0)  # [T] np.datetime64[...]
-           
-           # Base dir from out_path
-           #base_dir = os.path.dirname(os.path.abspath(out_path))
-           base_dir = os.path.abspath(out_path.rstrip("/"))
-           # Georeferencing constants you provided:
-           ULXMAP = -125.016666666666
-           ULYMAP = 49.933333333333
-           XDIM   = 0.008333333333
-           YDIM   = 0.008333333333
-           NODATA = -9999.0
-           
-           # Orientation: ensure row 0 is the northernmost row.
-           ds0 = xr.open_dataset(pre_paths[0])
-           lat = ds0[cfg.lat_name].values
-           ds0.close()
-           need_flip = (lat[0] < lat[-1])  # True if lat ascending south->north
-           
-           if need_flip:
-               Tall_to_write = Tall[:, ::-1, :]
-           else:
-               Tall_to_write = Tall
-           
-           # Write each time slice
-           count = 0
-           for i in range(Tall_to_write.shape[0]):
-               yyyymmdd = _format_yyyymmdd(times_all[i])
-               yyyy = yyyymmdd[:4]
-           
-               # Ensure per-year subdirectory
-               year_dir = os.path.join(base_dir, yyyy)
-               os.makedirs(year_dir, exist_ok=True)
-           
-               base = f"adj_best_ppt_us_us_30s_{yyyymmdd}"
-               bil_path = os.path.join(year_dir, base + ".bil")
-               hdr_path = os.path.join(year_dir, base + ".hdr")
-           
-               write_bil_pair(
-                   arr2d=Tall_to_write[i],
-                   bil_path=bil_path,
-                   hdr_path=hdr_path,
-                   ulxmap=ULXMAP,
-                   ulymap=ULYMAP,
-                   xdim=XDIM,
-                   ydim=YDIM,
-                   nodata=NODATA,
-                   force_little_endian=True
-               )
-               count += 1
-           
-           print(f"Wrote {count} BIL/HDR pairs under {base_dir}/<YYYY>/")
-          
 
+        # Write per-day BIL/HDR files
+        Tall = np.concatenate(out_days, axis=0)
+        times_all = np.concatenate(out_times, axis=0)
+        base_dir = os.path.abspath(out_path.rstrip("/"))
+        ULXMAP = -125.016666666666
+        ULYMAP = 49.933333333333
+        XDIM   = 0.008333333333
+        YDIM   = 0.008333333333
+        NODATA = -9999.0
+
+        ds0 = xr.open_dataset(pre_paths[0], engine="netcdf4")
+        lat = ds0[model_cfg.lat_name].values
+        ds0.close()
+        need_flip = (lat[0] < lat[-1])
+        Tall_to_write = Tall[:, ::-1, :] if need_flip else Tall
+
+        count = 0
+        for i2 in range(Tall_to_write.shape[0]):
+            yyyymmdd = _format_yyyymmdd(times_all[i2])
+            yyyy = yyyymmdd[:4]
+            year_dir = os.path.join(base_dir, yyyy)
+            os.makedirs(year_dir, exist_ok=True)
+            base = f"adj_best_ppt_us_us_30s_{yyyymmdd}"
+            bil_path = os.path.join(year_dir, base + ".bil")
+            hdr_path = os.path.join(year_dir, base + ".hdr")
+            write_bil_pair(arr2d=Tall_to_write[i2], bil_path=bil_path, hdr_path=hdr_path,
+                           ulxmap=ULXMAP, ulymap=ULYMAP, xdim=XDIM, ydim=YDIM, nodata=NODATA,
+                           force_little_endian=True)
+            count += 1
+        print(f"Wrote {count} BIL/HDR pairs under {base_dir}/<YYYY>/")
 
 # ---------------------------
 # CLI
 # ---------------------------
-
-
 def build_arg_parser():
     ap = argparse.ArgumentParser(description="Convective morphology correction for PRISM (PyTorch).")
     ap.add_argument("--mode", default="train", choices=["train", "infer"], required=True)
     ap.add_argument("--config", type=str, help="JSON config path (optional).")
 
-    # Existing Y (PRISM) paths
-    ap.add_argument("--train_paths", type=str, default='/nfs/pancake/u5/projects/vachek/automate_qc/netcdf/PRISM_daily_ppt_2009_2010.nc', nargs="*", help="Post-2001 train NetCDF/Zarr files (Y).")
-    ap.add_argument("--val_paths",   type=str, default='/nfs/pancake/u5/projects/vachek/automate_qc/netcdf/PRISM_daily_ppt_2014_2016.nc', nargs="*", help="Post-2001 val NetCDF/Zarr files (Y).")
+    ap.add_argument("--train_paths", type=str, nargs="*", help="Train NetCDF/Zarr files (Y).")
+    ap.add_argument("--val_paths",   type=str, nargs="*", help="Val   NetCDF/Zarr files (Y).")
 
-    # NEW: X paths (external degraded inputs)
-    ap.add_argument("--x_train_paths", type=str, nargs="*", help="Train NetCDF/Zarr files for X (degraded/alternate). If omitted, X is made by degrading Y.")
-    ap.add_argument("--x_val_paths",   type=str, nargs="*", help="Val   NetCDF/Zarr files for X (degraded/alternate). If omitted, X is made by degrading Y.")
-    ap.add_argument("--x_var",         type=str, default=None, help="Variable name for X (defaults to --prism_var if not set).")
+    ap.add_argument("--x_train_paths", type=str, nargs="*", help="Train files for X (if omitted, X is degraded Y).")
+    ap.add_argument("--x_val_paths",   type=str, nargs="*", help="Val   files for X (if omitted, X is degraded Y).")
+    ap.add_argument("--x_var",         type=str, default=None, help="Variable name for X (defaults to prism_var).")
 
     ap.add_argument("--static_dem",  type=str, default=None)
     ap.add_argument("--static_mask", type=str, default=None)
     ap.add_argument("--ckpt",        type=str, default=None)
 
-    ap.add_argument("--pre_paths",   type=str, default='/nfs/pancake/u5/projects/vachek/automate_qc/netcdf/PRISM_daily_ppt_2009_2010.nc', nargs="*", help="Pre-2001 NetCDF/Zarr files for Y during inference.")
-    # NEW: X at inference (optional)
-    ap.add_argument("--x_pre_paths", type=str, nargs="*", help="Pre-2001 NetCDF/Zarr files for X during inference; if omitted, X is produced by degrading Y.")
+    ap.add_argument("--pre_paths",   type=str, nargs="*", help="Files used for mask/clim/iteration in inference.")
+    ap.add_argument("--x_pre_paths", type=str, nargs="*", help="Files used as X in inference; if omitted, X=degraded Y.")
     ap.add_argument("--out_path",    type=str, default="./corrected_pre2001.nc")
-    
-    ap.add_argument("--batch_size", type=int, help="Per-GPU batch size (DDP) or global for single GPU.")
-    return ap
 
+    ap.add_argument("--batch_size", type=int, help="Per-GPU batch size for training.")
+    
+    ap.add_argument("--steps_per_epoch", type=int, default=None)
+    ap.add_argument("--val_steps", type=int, default=None)
+       
+    # in build_arg_parser()
+    ap.add_argument("--climatology_npy", type=str, default=None, help="Daily climatology .npy [366,H,W].")
+    ap.add_argument("--domain_mask_npy", type=str, default=None, help="Domain mask .npy [H,W] (0/1).")
+
+
+    ap.add_argument("--out_dir", type=str, default=None, help="Directory to write training outputs (config, ckpts).")
+    ap.add_argument("--ckpt_name", type=str, default=None, help="Filename for best checkpoint (default: best.pt).")
+
+    return ap
 
 def main():
     ap = build_arg_parser()
     args = ap.parse_args()
     cfg = Config()
 
-    # config file override as you already have...
+    # config override
     if args.config is not None:
         with open(args.config, "r") as f:
             j = json.load(f)
+        j = sanitize_cfg_dict(j)
         for k, v in j.items():
             setattr(cfg, k, v)
 
-    # CLI overrides for Y
     if args.train_paths: cfg.prism_train_paths = args.train_paths
     if args.val_paths:   cfg.prism_val_paths   = args.val_paths
 
-    # NEW: CLI overrides for X
     if args.x_train_paths: cfg.x_train_paths = args.x_train_paths
     if args.x_val_paths:   cfg.x_val_paths   = args.x_val_paths
     if args.x_var:         cfg.x_var         = args.x_var
 
-    # statics
     if args.static_dem:    cfg.static_dem_path  = args.static_dem
     if args.static_mask:   cfg.static_mask_path = args.static_mask
 
     if args.out_path:      cfg.out_path  = args.out_path
     if args.ckpt:          cfg.ckpt      = args.ckpt
-    
-    
+
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+        
+        
+    # world size before ddp_setup() may be unavailable; use env if present
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    bs = cfg.batch_size
+    
+    if args.steps_per_epoch is not None:
+        cfg.train_crops_per_epoch = args.steps_per_epoch * bs * world_size_env
+    if args.val_steps is not None:
+        cfg.val_crops_per_epoch   = args.val_steps * bs  # val runs only on rank 0
 
 
-    if args.mode == "train":
+    if args.climatology_npy: cfg.climatology_npy = args.climatology_npy
+    if args.domain_mask_npy: cfg.domain_mask_npy = args.domain_mask_npy
+
+  #  cfg.train_crops_per_epoch = max(cfg.batch_size * (dist.get_world_size() if ddp_is_initialized() else 1) * 8, 64)
+  #  cfg.val_crops_per_epoch   = 64
+
+    if args.out_dir:
+        cfg.out_dir = args.out_dir
+    if args.ckpt_name:
+        cfg.ckpt_name = args.ckpt_name
+
+    if args.mode == "train" :
         assert cfg.prism_train_paths and cfg.prism_val_paths, "Provide --train_paths and --val_paths"
         train(cfg)
 
     elif args.mode == "infer":
         assert args.ckpt and args.pre_paths, "Provide --ckpt and --pre_paths"
-        # NEW: pass optional X paths
         cfg.x_pre_paths = args.x_pre_paths if args.x_pre_paths else None
         infer_on_stack(cfg, args.ckpt, args.pre_paths, args.out_path,
                        static_dem_path=args.static_dem, static_mask_path=args.static_mask)
 
 if __name__ == "__main__":
     main()
-
-
-# runfile(
-#     '/nfs/pancake/u5/projects/vachek/automate_qc/convective_correction_pytorch3.py',
-#     args="""--mode train
-#             --train_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_ppt_800_2023.nc
-#             --val_paths   /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_ppt_800_2024.nc
-#             --x_train_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2023.nc
-#             --x_val_paths   /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2024.nc
-#             --x_var ppt"""
-# )
-
-
-# runfile('/nfs/pancake/u5/projects/vachek/automate_qc/convective_correction_pytorch3.py',
-#         args='--mode train '
-#              '--train_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_ppt_800_2021_2023.nc '
-#              '--val_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_ppt_800_2024_2025.nc'
-#              '--x_train_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2021_2023.nc '
-#              '--x_val_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2024_2025.nc'
-#              '--x_var ppt' 
-#              )
-
-
-# runfile('/nfs/pancake/u5/projects/vachek/automate_qc/convective_correction_pytorch3.py',
-#         args='--mode infer '
-#              '--ckpt /nfs/pancake/u5/projects/vachek/automate_qc/runs/convective_correction/best.pt '
-#              '--pre_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_2015.nc '
-#              '--out_path /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/radar_informed_ppt_2015.nc')
-
-# runfile('/nfs/pancake/u5/projects/vachek/automate_qc/convective_correction_pytorch4.py',
-#         args='--mode infer '
-#              '--ckpt /nfs/pancake/u5/projects/vachek/automate_qc/runs/convective_correction/best.pt '
-#              '--pre_paths /nfs/pancake/u5/projects/vachek/automate_qc/netcdf/noradar_ppt_800_2015.nc '
-#              '--out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/')
-
-# runfile(
-#    '/nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py',
-#    args="""--mode train
-#            --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc
-#            --val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc
-#            --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.nc
-#            --x_val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc
-#            --out_path     /nfs/pancake/u5/projects/vachek/radar_ai/models/
-#            --ckpt         model_2015_2019.pt
-#            --x_var ppt"""
-
-
-# python -m torch.distributed.run --standalone --nproc_per_node=2 /nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py \
-#   --mode train \
-#   --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc \
-#   --val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc \
-#   --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.nc \
-#   --x_val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc \
-#   --x_var ppt \
-#   --batch_size 2
-
-# python -m torch.distributed.run --standalone --nproc_per_node=2 /nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py \
-#   --mode train \
-#   --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.zarr \
-#   --val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.zarr \
-#   --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.zarr \
-#   --x_val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.zarr \
-#   --x_var ppt \
-#   --batch_size 2
-
-#  python -m torch.distributed.run --standalone --nproc_per_node=2 /nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py \
-#      --mode infer \
-#     --ckpt /nfs/pancake/u5/projects/vachek/automate_qc/runs/convective_correction/best.pt  \
-#     --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc  \
-#     --out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet1/ehdr/800m/ppt/daily/)
-    
-    
-
-
-#python -m torch.distributed.run --standalone --nproc_per_node=2 /nfs/pancake/u5/projects/vachek/radar_ai/unet_radar_correction.py --mode infer --ckpt /nfs/pancake/u5/projects/vachek/automate_qc/runs/convective_correction/best.pt --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc --x_pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc --x_var ppt --out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/
-
-
-
-
-
-
-
-
-
-
-

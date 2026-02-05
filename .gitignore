@@ -5,6 +5,11 @@
 /models/
 /older/
 
+netcdf/
+unet_radar_correction2.py
+unet_radar_correction3.py
+
+
 # User-specific files
 *.rsuser
 *.suo

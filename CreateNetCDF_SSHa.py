@@ -40,67 +40,67 @@ DEFAULT_HOSTS = [
     "prismcpu3.nacse.org",
     "prismcpu4.nacse.org",
 ]
-alll=False
+alll=True
 if alll:
     DEFAULT_TASKS = [
         # y train (WITH radar)
         dict(
             root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
-            years="2015:2019",
+            years="2002:2019",
             var_name="ppt",
             out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.nc",
             include_text="adj_best_ppt",
         ),
         # y val (WITH radar)
-        dict(
-            root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
-            years="2023",
-            var_name="ppt",
-            out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc",
-            include_text="adj_best_ppt",
-        ),
+        # dict(
+        #     root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
+        #     years="2023",
+        #     var_name="ppt",
+        #     out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.nc",
+        #     include_text="adj_best_ppt",
+        # ),
         # x train (NO radar)
         dict(
             root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
-            years="2015:2019",
+            years="2002:2019",
             var_name="ppt",
             out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.nc",
             include_text="cai_ppt",
         ),
         # x val (NO radar)
-        dict(
-            root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
-            years="2023",
-            var_name="ppt",
-            out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc",
-            include_text="cai_ppt",
-        ),
-        # infer-only (NO radar)
-        dict(
-            root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
-            years="2024",
-            var_name="ppt",
-            out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc",
-            include_text="cai_ppt",
-        ),
+        # dict(
+        #     root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
+        #     years="2023",
+        #     var_name="ppt",
+        #     out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.nc",
+        #     include_text="cai_ppt",
+        # ),
+        # # infer-only (NO radar)
+        # dict(
+        #     root="/nfs/pancake/u4/data/prism/us/an91/r2112/ehdr/800m/ppt/daily/",
+        #     years="2024",
+        #     var_name="ppt",
+        #     out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc",
+        #     include_text="cai_ppt",
+        # ),
         
-        dict(
-            root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
-            years="1982:1985",
-            var_name="ppt",
-            out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer80_85.nc",
-            include_text="cai_ppt",
-        ),
+        # dict(
+        #     root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
+        #     years="1982:1985",
+        #     var_name="ppt",
+        #     out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer80_85.nc",
+        #     include_text="cai_ppt",
+        # ),
     ]
 else:
     DEFAULT_TASKS = [
     
         dict(
-            root="/nfs/pancake/u4/data/prism/us/an81/r1503/ehdr/800m/ppt/daily/",
-            years="1982:1985",
+            root="/nfs/pancake/prism_current/us/an/ehdr/800m/ppt/daily/normals/",
+            years="2020",
             var_name="ppt",
-            out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer80_85.nc",
-            include_text="cai_ppt",
+            out_path="/nfs/pancake/u5/projects/vachek/radar_ai/netcdf/normals.nc",
+            include_text="prism_ppt",
         ),
     ]
 
