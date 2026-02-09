@@ -11,26 +11,27 @@ export HDF5_USE_FILE_LOCKING=FALSE
 export MKL_NUM_THREADS=1
 export NUMEXPR_MAX_THREADS=1
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
+export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 
 python unet_radar_correction6.py \
   --mode train \
   --ckpt /nfs/pancake/u5/projects/vachek/radar_ai/models/best_production_800a.pt \
-  --train_paths /scratch/$USER/y_train.zarr \
-  --val_paths /scratch/$USER/y_val.zarr \
-  --x_train_paths /scratch/$USER/x_train.zarr \
-  --x_val_paths /scratch/$USER/x_val.zarr \
+  --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train_opt.zarr \
+  --val_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val_opt.zarr \
+  --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train_opt.zarr \
+  --x_val_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val_opt.zarr \
   --x_var ppt \
   --steps_per_epoch 1200 \
   --val_steps 200 \
-  --batch_size 12 \
-  --num_workers 32 \
-  --val_num_workers 10 \
-  --prefetch_factor 8 \
-  --persistent_workers \
-  --timeslice_cache 512 \
+  --batch_size 8 \
+  --num_workers 12 \
+  --val_num_workers 6 \
+  --prefetch_factor 3 \
+ 
+  --timeslice_cache 256 \
+  --patch 896 \
   --domain_mask_npy /scratch/$USER/prism_domain_mask.npy \
   --climatology_npy /scratch/$USER/prism_daily_normals_366.npy \
   --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc \
