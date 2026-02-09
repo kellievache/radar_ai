@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -21,7 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import time, random
+import time
+
 try:
     import xarray as xr  # NetCDF/Zarr I/O
 except ImportError:
@@ -30,7 +30,7 @@ except ImportError:
 try:
     from tqdm import tqdm
 except ImportError:
-    tqdm = lambda x, **k: x
+    tqdm = lambda x, **k: x  # fallback: identity
 
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data._utils.collate import default_collate
@@ -109,23 +109,21 @@ def valid_mask(arr: np.ndarray, sentinel: float = -9999.0) -> np.ndarray:
     m = np.where(arr == sentinel, 0.0, m).astype(np.float32)
     return m
 
-def apply_residual_gate_in_tr_space(X_tr: torch.Tensor,
-                                    delta_tr: torch.Tensor,
-                                    M: torch.Tensor,
-                                    c: float = 1.0,      # center in transform space; ~log1p(1 mm)
-                                    beta: float = 1.0,   # slope of the transition
-                                    alpha_bg: float = 1.0,  # background weight outside mask
-                                   ) -> torch.Tensor:
+def apply_residual_gate_in_tr_space(
+    X_tr: torch.Tensor,
+    delta_tr: torch.Tensor,
+    M: torch.Tensor,
+    c: float = 1.0,      # center in transform space; ~log1p(1 mm)
+    beta: float = 1.0,   # slope of the transition
+    alpha_bg: float = 1.0,  # background weight outside mask
+) -> torch.Tensor:
     """
     X_tr:   [B,1,H,W]   first channel of X in transform space
     delta_tr: [B,1,H,W] residual predicted by the model (also in transform space)
     M:      [B,1,H,W]   mask (1 valid; 0 invalid/outside domain)
     Returns: Y_pred_tr in transform space
     """
-    # Smooth, bounded gate in transform space
-    # higher X -> smaller residual; lower X -> larger residual allowed
     residual_weight = torch.sigmoid(beta * (c - X_tr))
-    # Make it mask-aware: inside mask use the gate; outside mask allow full residual (or alpha_bg)
     residual_weight = residual_weight * M + (1.0 - M) * alpha_bg
     return X_tr + residual_weight * delta_tr
 
@@ -238,7 +236,7 @@ class Config:
     apply_degrade_prob: float = 1.0
 
     # Training
-    epochs: int = 50
+    epochs: int = 200
     min_epochs: int = 10
     batch_size: int = 8    # per-GPU in DDP
     learning_rate: float = 2e-4
@@ -248,13 +246,18 @@ class Config:
     amp: bool = True
     patience: int = 30
 
+    # Dataloader tuning
+    val_num_workers: int = 8
+    prefetch_factor: Optional[int] = None
+    persistent_workers: bool = False
+
     # Loss weights
     loss: str = "huber"     # 'l1'|'huber'
-    w_grad: float = 0.3
-    w_spec: float = 0.05
-    w_mass: float = 0.01
-    w_hp: float = 0.2
-    w_fss: float = 0.02
+    w_grad: float = 0.15
+    w_spec: float = 0.08
+    w_mass: float = 0.03
+    w_hp: float = 0.02
+    w_fss: float = 0.15
 
     # FSS thresholds (mm/day)
     fss_thresholds: List[float] = None
@@ -293,15 +296,18 @@ class Config:
 
     # NEW: time-slice cache size (planes per variable to keep per rank)
     timeslice_cache: int = 3
-    
+
     domain_mask_npy: Optional[str] = None
     climatology_npy: Optional[str] = None
-    
+
     gate_c: float = 1.4
     gate_beta: float = 1.5
     gate_alpha_bg: float = 1.0
-    
 
+    coarsen_factor = 1
+    coarsen_mode = "mean_max"      # adds both mean and max precip as input channels
+    coarsen_mask_threshold = 0.5
+    precip_log1p = True
 
     def __post_init__(self):
         if self.fss_thresholds is None:
@@ -391,14 +397,51 @@ def _barrier(device):
         else:
             dist.barrier()
 
+def _block_reduce_mean_max(arr: np.ndarray, f: int):
+    """
+    Coarsen 2D array by factor f using block mean and block max.
+    Returns (mean2d, max2d) as float32.
+    Trims bottom/right edges if not divisible by f.
+    """
+    H, W = arr.shape
+    Hc = (H // f) * f
+    Wc = (W // f) * f
+    if Hc != H or Wc != W:
+        arr = arr[:Hc, :Wc]
+        H, W = Hc, Wc
+    arr4 = arr.reshape(H // f, f, W // f, f)
+    mean2d = arr4.mean(axis=(1, 3)).astype(np.float32)
+    max2d  = arr4.max(axis=(1, 3)).astype(np.float32)
+    return mean2d, max2d
+
+def _block_reduce_mean(arr: np.ndarray, f: int):
+    H, W = arr.shape
+    Hc = (H // f) * f
+    Wc = (W // f) * f
+    if Hc != H or Wc != W:
+        arr = arr[:Hc, :Wc]
+        H, W = Hc, Wc
+    arr4 = arr.reshape(H // f, f, W // f, f)
+    return arr4.mean(axis=(1, 3)).astype(np.float32)
+
+def _block_reduce_mask_fraction(arr_mask01: np.ndarray, f: int, thr: float):
+    """
+    Coarsen a 0/1 mask by block-mean and then threshold to 0/1.
+    Also returns the fractional coverage if you ever want it.
+    """
+    frac = _block_reduce_mean(arr_mask01.astype(np.float32), f)
+    coarsemask = (frac >= float(thr)).astype(np.float32)
+    return coarsemask, frac.astype(np.float32)
+
 # ---------------------------
 # Datasets
 # ---------------------------
 class XRRandomPatchDataset(Dataset):
     """
     Streaming random (or tiled) patches directly from NetCDF/Zarr.
-    Channels: [x_tr, (dem?), mask, clim_tr]
+    Channels: [x_tr(mean,max), (dem?), mask, clim_tr] when coarsening is enabled.
     """
+
     def __init__(self, y_paths: List[str], x_paths: Optional[List[str]], cfg: Config, mode: str = "train"):
         super().__init__()
         assert xr is not None, "xarray is required."
@@ -406,6 +449,12 @@ class XRRandomPatchDataset(Dataset):
         self.mode = mode
         self.patch = int(getattr(cfg, "patch", 768))
         self.transform = cfg.transform
+
+        # Coarsening controls
+        self.coarsen_factor = int(getattr(cfg, "coarsen_factor", 1))
+        self.coarsen_mode = str(getattr(cfg, "coarsen_mode", "mean_max")).lower()
+        self.mask_thr = float(getattr(cfg, "coarsen_mask_threshold", 0.5))
+        self.use_log1p = bool(getattr(cfg, "precip_log1p", False))
 
         # Open datasets
         self.ds_y = open_multi_auto(y_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
@@ -415,8 +464,8 @@ class XRRandomPatchDataset(Dataset):
         self.y_dim = v.dims[-2]
         self.x_dim = v.dims[-1]
         self.T = int(self.ds_y.sizes[self.t_dim])
-        self.H = int(self.ds_y.sizes[self.y_dim])
-        self.W = int(self.ds_y.sizes[self.x_dim])
+        self.H_fine = int(self.ds_y.sizes[self.y_dim])
+        self.W_fine = int(self.ds_y.sizes[self.x_dim])
 
         if x_paths:
             self.ds_x = open_multi_auto(x_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
@@ -428,62 +477,88 @@ class XRRandomPatchDataset(Dataset):
         self._y_paths = list(y_paths)
         self._x_paths = list(x_paths) if x_paths else None
 
-        # -------- Domain mask & daily climatology --------
-        # domain mask
+        # Domain mask & daily climatology
         if getattr(cfg, "domain_mask_npy", None):
-            self.domain_mask = np.load(cfg.domain_mask_npy, mmap_mode="r").astype(np.float32)
+            self.domain_mask_fine = np.load(cfg.domain_mask_npy, mmap_mode="r").astype(np.float32)
         else:
-            # Default: assume all valid (or compute from one slice if you prefer)
-            self.domain_mask = np.ones((self.H, self.W), dtype=np.float32)
-        
-        # daily climatology [366, H, W]
+            self.domain_mask_fine = np.ones((self.H_fine, self.W_fine), dtype=np.float32)
+
         if getattr(cfg, "climatology_npy", None):
-            self.clim_daily = np.load(cfg.climatology_npy, mmap_mode="r")
-            if self.clim_daily.ndim != 3 or self.clim_daily.shape[0] != 366:
+            self.clim_daily_fine = np.load(cfg.climatology_npy, mmap_mode="r")
+            if self.clim_daily_fine.ndim != 3 or self.clim_daily_fine.shape[0] != 366:
+                raise ValueError(f"climatology_npy must be [366,H,W], got {self.clim_daily_fine.shape}")
+            if self.clim_daily_fine.shape[1] != self.H_fine or self.clim_daily_fine.shape[2] != self.W_fine:
                 raise ValueError(
-                    f"climatology_npy must be [366,H,W], got {self.clim_daily.shape}"
-                )
-            if self.clim_daily.shape[1] != self.H or self.clim_daily.shape[2] != self.W:
-                raise ValueError(
-                    f"climatology_npy spatial shape {self.clim_daily.shape[1:]} "
-                    f"does not match data grid {(self.H, self.W)}"
+                    f"climatology_npy spatial shape {self.clim_daily_fine.shape[1:]} "
+                    f"does not match data grid {(self.H_fine, self.W_fine)}"
                 )
         else:
-            # If not provided, fall back to zeros (no prior)
-            self.clim_daily = np.zeros((366, self.H, self.W), dtype=np.float32)
-        
-        # Precompute day-of-year (0..365) for each time index t
+            self.clim_daily_fine = np.zeros((366, self.H_fine, self.W_fine), dtype=np.float32)
+
+        # Precompute day-of-year (0..365)
         try:
-            # xarray's dt access does not trigger a big compute; it's on the coord
             doy = self.ds_y[self.t_dim].dt.dayofyear.values  # 1..366
             self.doy_idx = (doy - 1).astype(np.int16)        # 0..365
         except Exception:
-            # Fallback: assume first dimension is time-like and evenly maps to 0..365 mod 366
             self.doy_idx = np.arange(self.T, dtype=np.int64) % 366
 
-        # ---- Time-slice LRU cache (per rank) ----
+        # Time-slice caches
         self._cache_limit = int(getattr(cfg, "timeslice_cache", 3))
-        self._cache = {
-            "y": OrderedDict(),   # key: t -> np.ndarray[H, W] float32
-            "x": OrderedDict(),   # only used if self.ds_x is not None
-        }
+        self._cache = {"y": OrderedDict(), "x": OrderedDict()}        # fine planes
+        self._cache_coarse = {"y": OrderedDict(), "x": OrderedDict()} # coarse planes mean/max
 
-        # Statics
-        self.dem = None
+        # Statics (DEM / user mask) at fine res
+        self.dem_fine = None
         if cfg.use_dem and cfg.static_dem_path:
             dem = load_static(cfg.static_dem_path)
             if dem is not None:
                 dem = (dem - np.nanmean(dem)) / (np.nanstd(dem) + 1e-6)
                 dem = np.where(np.isfinite(dem), dem, 0.0)
-                self.dem = dem.astype(np.float32)
+                self.dem_fine = dem.astype(np.float32)
 
-        self.user_static_mask = None
+        self.user_static_mask_fine = None
         if cfg.use_mask and cfg.static_mask_path:
             sm = load_static(cfg.static_mask_path)
             if sm is not None:
                 sm = (sm > 0.5).astype(np.float32)
                 sm = np.where(np.isfinite(sm), sm, 0.0)
-                self.user_static_mask = sm.astype(np.float32)
+                self.user_static_mask_fine = sm.astype(np.float32)
+
+        # Coarsen statics & geometry
+        if self.coarsen_factor > 1:
+            f = self.coarsen_factor
+            Hc = (self.H_fine // f) * f
+            Wc = (self.W_fine // f) * f
+
+            dom_trim = self.domain_mask_fine[:Hc, :Wc]
+            self.domain_mask_coarse, self.domain_mask_fraction = _block_reduce_mask_fraction(dom_trim, f, self.mask_thr)
+
+            if self.dem_fine is not None:
+                self.dem_coarse = _block_reduce_mean(self.dem_fine[:Hc, :Wc], f)
+            else:
+                self.dem_coarse = None
+
+            if self.user_static_mask_fine is not None:
+                usm_trim = self.user_static_mask_fine[:Hc, :Wc]
+                self.user_static_mask_coarse, _ = _block_reduce_mask_fraction(usm_trim, f, 0.5)
+            else:
+                self.user_static_mask_coarse = None
+
+            C = []
+            for d in range(366):
+                C.append(_block_reduce_mean(self.clim_daily_fine[d, :Hc, :Wc], f))
+            self.clim_daily_coarse = np.stack(C, axis=0).astype(np.float32)
+
+            self.H = self.domain_mask_coarse.shape[0]
+            self.W = self.domain_mask_coarse.shape[1]
+            self.patch = max(1, self.patch // f)   # interpret patch at coarse scale
+        else:
+            self.H = self.H_fine
+            self.W = self.W_fine
+            self.domain_mask_coarse = None
+            self.dem_coarse = None
+            self.user_static_mask_coarse = None
+            self.clim_daily_coarse = None
 
         # Length & sampler
         if mode == "train":
@@ -504,11 +579,9 @@ class XRRandomPatchDataset(Dataset):
                 self._rng = random.Random(cfg.seed + 1)
 
     def reseed(self, base_seed: int, epoch: int, rank: int):
-        """Per-epoch, per-rank RNG reseed for crop sampling."""
         self._rng = random.Random(int(base_seed + epoch * 997 + rank))
 
     def reopen(self):
-        """Reopen xarray Datasets to refresh backend state at epoch boundaries."""
         try:
             self.ds_y.close()
         except Exception:
@@ -520,9 +593,6 @@ class XRRandomPatchDataset(Dataset):
             except Exception:
                 pass
             self.ds_x = open_multi_auto(self._x_paths, time_dim=self.cfg.time_name, prefer_chunks_time1=True)
-        # Optional: clear caches here if you prefer strict per-epoch freshness
-        # self._cache["y"].clear()
-        # self._cache["x"].clear()
 
     def __len__(self):
         return self.N
@@ -550,124 +620,149 @@ class XRRandomPatchDataset(Dataset):
         return self.tiles[idx]
 
     def _window(self, ds, var, t, y0, x0, h, w):
-        sl = ds[var].isel(
-            **{
-                self.t_dim: t,
-                self.y_dim: slice(y0, y0 + h),
-                self.x_dim: slice(x0, x0 + w),
-            }
-        )
-        # Force single-threaded dask compute to avoid cross-process threaded deadlocks
+        sl = ds[var].isel(**{self.t_dim: t, self.y_dim: slice(y0, y0 + h), self.x_dim: slice(x0, x0 + w)})
         import dask
         with dask.config.set(scheduler="single-threaded"):
             arr = sl.compute().data
         return np.asarray(arr, dtype=np.float32)
 
     def _get_plane(self, which: str, t: int) -> np.ndarray:
-        """
-        Return a full 2D plane (H, W) for the given time index `t`.
-        - which: 'y' or 'x'
-        - Uses an LRU cache per-rank. If miss, reads the full plane once (single-threaded).
-        """
+        """Fine resolution plane [H_fine, W_fine]."""
         assert which in ("y", "x")
         cache = self._cache[which]
         if t in cache:
-            arr = cache.pop(t)  # move to most-recent
+            arr = cache.pop(t)
             cache[t] = arr
             return arr
 
-        # Choose dataset & var
         ds = self.ds_y if which == "y" else self.ds_x
         if ds is None:
             raise RuntimeError(f"_get_plane({which}, t={t}) requested but ds is None.")
         var = self.var_y if which == "y" else self.var_x
 
-        # Lazily select the time slice
         sl = ds[var].isel(**{self.t_dim: t})
 
-        # Robust: compute synchronously to avoid multi-process thread deadlocks on NFS
         import dask
         with dask.config.set(scheduler="single-threaded"):
-            # sl is a DataArray with dims (y_dim, x_dim)
-            arr = np.asarray(sl.compute().data, dtype=np.float32)  # [H, W]
+            arr = np.asarray(sl.compute().data, dtype=np.float32)  # [H_fine, W_fine]
 
-        # Insert into LRU and enforce size
         cache[t] = arr
         while len(cache) > self._cache_limit:
-            cache.popitem(last=False)  # drop least-recent
+            cache.popitem(last=False)
         return arr
 
+    # Coarse plane getter with mean+max for precip
+    def _get_plane_coarse_precip(self, which: str, t: int):
+        """
+        Returns (mean_coarse, max_coarse) at coarse resolution [H, W].
+        Uses LRU cache and trims to divisibility by factor.
+        """
+        assert which in ("y", "x")
+        if self.coarsen_factor <= 1:
+            fine = self._get_plane(which, t)
+            return fine, fine
+
+        cache = self._cache_coarse[which]
+        if t in cache:
+            val = cache.pop(t)
+            cache[t] = val
+            return val
+
+        fine = self._get_plane(which, t)
+        mean2d, max2d = _block_reduce_mean_max(fine, self.coarsen_factor)
+        cache[t] = (mean2d, max2d)
+        while len(cache) > self._cache_limit:
+            cache.popitem(last=False)
+        return mean2d, max2d
+
     def __getitem__(self, idx: int):
-        # ---- pick window ----
+        # ---- pick window IN COARSE COORDS ----
         t, y0, x0, h, w = self._sampler(idx)
 
-        # 1) Y plane -> Y crop
-        y_plane = self._get_plane("y", t)                  # [H, W]
-        if y_plane is None or not isinstance(y_plane, np.ndarray):
-            raise RuntimeError(f"y_plane is invalid at t={t}")
-        y_mm = y_plane[y0:y0+h, x0:x0+w]                   # [h, w]
-        if y_mm.size == 0:
-            raise RuntimeError(f"Empty Y crop at t={t}, y0={y0}, x0={x0}, h={h}, w={w}")
+        # 1) Y plane(s) at coarse res
+        y_mean_plane, y_max_plane = self._get_plane_coarse_precip("y", t)
+        y_mean = y_mean_plane[y0:y0+h, x0:x0+w]
+        y_max  = y_max_plane[y0:y0+h, x0:x0+w]
 
-        # 2) Masks from Y crop + domain mask
-        m_data = valid_mask(y_mm, sentinel=-9999.0).astype(np.float32)
-        m_dom  = self.domain_mask[y0:y0+h, x0:x0+w]
-        m = (m_data * m_dom).astype(np.float32)
-        if self.user_static_mask is not None:
-            m = (m * (self.user_static_mask[y0:y0+h, x0:x0+w] > 0.5).astype(np.float32)).astype(np.float32)
-
-        # 3) Sanitize Y with mask
-        y_mm = np.where(m > 0.5, np.clip(y_mm, 0.0, 1e6), 0.0).astype(np.float32)
-        y_t  = torch.from_numpy(y_mm)[None, ...]                           # [1, h, w]
-
-        # 4) X crop (cached plane or degrade path) -> sanitize with m
-        if self.ds_x is not None:
-            x_plane = self._get_plane("x", t)                              # [H, W]
-            if x_plane is None or not isinstance(x_plane, np.ndarray):
-                raise RuntimeError(f"x_plane is invalid at t={t}")
-            x_np = x_plane[y0:y0+h, x0:x0+w]                               # [h, w]
-            x_np = np.where(np.isfinite(x_np), x_np, 0.0).astype(np.float32)
-            x_np = np.where(m > 0.5, np.clip(x_np, 0.0, 1e6), 0.0)
-            x_mm = torch.from_numpy(x_np)[None, ...]                       # [1, h, w]
+        # 2) Masks
+        m_data = valid_mask(y_mean, sentinel=-9999.0).astype(np.float32)
+        if self.coarsen_factor > 1:
+            m_dom = self.domain_mask_coarse[y0:y0+h, x0:x0+w]
         else:
-            # No external X: pass Y-as-X; if GPU degradation is desired, we do it in the train loop
-            if not self.cfg.degrade_in_dataset:
-                x_mm = y_t.clone()                                         # [1, h, w]
-            else:
-                x_mm = apply_degradation(y_t.unsqueeze(0), self.cfg).squeeze(0)
-            x_mm = x_mm * torch.from_numpy(m)[None, ...]
+            m_dom = self.domain_mask_fine[y0:y0+h, x0:x0+w]
+        m = (m_data * m_dom).astype(np.float32)
+        if self.user_static_mask_fine is not None:
+            usm = self.user_static_mask_coarse if self.coarsen_factor > 1 else self.user_static_mask_fine
+            m = (m * (usm[y0:y0+h, x0:x0+w] > 0.5).astype(np.float32)).astype(np.float32)
 
-        # 5) Transform to training space + small input noise (keep invalid at zero)
-        y_tr = mm_to_transform(y_t, self.transform).float()
-        x_tr = mm_to_transform(x_mm, self.transform).float()
-        x_tr = add_noise_transformed(x_tr, self.cfg.degrade_additive_noise_std)
-        x_tr = x_tr * torch.from_numpy(m)[None, ...]
+        # 3) Sanitize Y
+        y_mean = np.where(m > 0.5, np.clip(y_mean, 0.0, 1e6), 0.0).astype(np.float32)
 
-        # 6) Assemble channels: [x_tr, (dem?), mask, clim_tr]
-        chans = [x_tr]
-        if self.dem is not None:
-            chans.append(torch.from_numpy(self.dem[y0:y0+h, x0:x0+w])[None, ...])
-        chans.append(torch.from_numpy(m)[None, ...])
+        # Optional log1p stabilizer
+        if self.use_log1p:
+            y_mean = np.log1p(y_mean).astype(np.float32)
+            y_max  = np.log1p(np.where(m > 0.5, np.clip(y_max, 0.0, 1e6), 0.0)).astype(np.float32)
 
-        # Day-of-year slice from daily climatology
+        y_t = torch.from_numpy(y_mean)[None, ...]  # [1, h, w]
+
+        # 4) X mean + max at coarse res
+        if self.ds_x is not None:
+            x_mean_plane, x_max_plane = self._get_plane_coarse_precip("x", t)
+        else:
+            x_mean_plane, x_max_plane = y_mean_plane, y_max_plane
+
+        x_mean_np = x_mean_plane[y0:y0+h, x0:x0+w]
+        x_max_np  = x_max_plane[y0:y0+h, x0:x0+w]
+        x_mean_np = np.where(np.isfinite(x_mean_np), x_mean_np, 0.0).astype(np.float32)
+        x_max_np  = np.where(np.isfinite(x_max_np),  x_max_np,  0.0).astype(np.float32)
+
+        if self.use_log1p:
+            x_mean_np = np.log1p(np.clip(x_mean_np, 0.0, 1e6)).astype(np.float32)
+            x_max_np  = np.log1p(np.clip(x_max_np,  0.0, 1e6)).astype(np.float32)
+
+        x_mean_t = torch.from_numpy(np.where(m > 0.5, x_mean_np, 0.0))[None, ...]
+        x_max_t  = torch.from_numpy(np.where(m > 0.5, x_max_np,  0.0))[None, ...]
+
+        # 5) Transform to training space + light noise
+        y_tr       = mm_to_transform(y_t, self.transform).float()
+        x_mean_tr  = mm_to_transform(x_mean_t, self.transform).float()
+        x_max_tr   = mm_to_transform(x_max_t,  self.transform).float()
+
+        x_mean_tr  = add_noise_transformed(x_mean_tr, self.cfg.degrade_additive_noise_std)
+        x_max_tr   = add_noise_transformed(x_max_tr,  self.cfg.degrade_additive_noise_std)
+
+        # Mask after transform
+        m_torch = torch.from_numpy(m)[None, ...]
+        x_mean_tr = x_mean_tr * m_torch
+        x_max_tr  = x_max_tr  * m_torch
+
+        # 6) Assemble channels: [x_mean_tr, x_max_tr, (dem?), mask, clim_tr]
+        chans = [x_mean_tr, x_max_tr]
+
+        if self.dem_fine is not None:
+            dem_use = self.dem_coarse if self.coarsen_factor > 1 else self.dem_fine
+            chans.append(torch.from_numpy(dem_use[y0:y0+h, x0:x0+w])[None, ...])
+
+        chans.append(m_torch)  # mask channel
+
+        # Daily climatology (coarsened)
         doy = int(self.doy_idx[t])  # 0..365
-        clim_crop = self.clim_daily[doy, y0:y0+h, x0:x0+w].astype(np.float32)      
-        clim_crop = np.where(np.isfinite(clim_crop), clim_crop, 0.0).astype(np.float32)# NEW: sanitize NaNs before transform
-
-        clim_tr = 0.1 * mm_to_transform(torch.from_numpy(clim_crop)[None, ...], self.transform)
-        # mask the climatology channel to zero outside domain/valid pixels
-        clim_tr = clim_tr * torch.from_numpy(m)[None, ...]
+        if self.coarsen_factor > 1:
+            clim2d = self.clim_daily_coarse[doy, y0:y0+h, x0:x0+w].astype(np.float32)
+        else:
+            clim2d = self.clim_daily_fine[doy, y0:y0+h, x0:x0+w].astype(np.float32)
+        clim2d = np.where(np.isfinite(clim2d), clim2d, 0.0).astype(np.float32)
+        if self.use_log1p:
+            clim2d = np.log1p(clim2d).astype(np.float32)
+        clim_tr = 0.1 * mm_to_transform(torch.from_numpy(clim2d)[None, ...], self.transform)
+        clim_tr = clim_tr * m_torch
         chans.append(clim_tr)
 
-        X = torch.cat(chans, dim=0).float()                  # [C, h, w]
-        
-        # NEW: sanitize assembled X
+        X = torch.cat(chans, dim=0).float()  # [C, h, w]
         X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        Y = y_tr.float()                     # [1, h, w]
+        M = m_torch.float()                  # [1, h, w]
 
-        Y = y_tr.float()                                     # [1, h, w]
-        M = torch.from_numpy(m)[None, ...].float()           # [1, h, w]
-
-        # Final sanity
         if not (torch.is_tensor(X) and torch.is_tensor(Y) and torch.is_tensor(M)):
             raise RuntimeError("Dataset produced non-tensor outputs")
         return X, Y, M
@@ -678,7 +773,6 @@ class XRRandomPatchDataset(Dataset):
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, norm='batch', act='silu'):
         super().__init__()
-        #Norm = nn.BatchNorm2d if norm == 'batch' else nn.InstanceNorm2d
         Norm = lambda ch: nn.GroupNorm(8, ch)
         Act = nn.SiLU if act == 'silu' else nn.ReLU
         self.block = nn.Sequential(
@@ -689,14 +783,16 @@ class ConvBlock(nn.Module):
             Norm(out_ch),
             Act(inplace=True),
         )
-    def forward(self, x): return self.block(x)
+    def forward(self, x):
+        return self.block(x)
 
 class Down(nn.Module):
     def __init__(self, in_ch, out_ch, **kw):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
         self.conv = ConvBlock(in_ch, out_ch, **kw)
-    def forward(self, x): return self.conv(self.pool(x))
+    def forward(self, x):
+        return self.conv(self.pool(x))
 
 class Up(nn.Module):
     def __init__(self, in_ch, out_ch, bilinear=True, **kw):
@@ -717,8 +813,11 @@ class Up(nn.Module):
         return self.conv(x)
 
 class OutConv(nn.Module):
-    def __init__(self, in_ch, out_ch): super().__init__(); self.conv = nn.Conv2d(in_ch, out_ch, 1)
-    def forward(self, x): return self.conv(x)
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 1)
+    def forward(self, x):
+        return self.conv(x)
 
 class ClimateUNet(nn.Module):
     def __init__(self, in_ch, base_ch=64, norm='batch', act='silu', bilinear=True):
@@ -745,7 +844,48 @@ class ClimateUNet(nn.Module):
         x = self.up3(x,  x2)
         x = self.up4(x,  x1)
         return self.outc(x)
+    
+    
+class ClimateUNet5(nn.Module):
+    def __init__(self, in_ch, base_ch=64, norm='batch', act='silu', bilinear=True):
+        super().__init__()
+        # ----- Encoder (5 levels) -----
+        self.inc   = ConvBlock(in_ch, base_ch, norm=norm, act=act)               # x1
+        self.down1 = Down(base_ch,      base_ch*2, norm=norm, act=act)           # x2
+        self.down2 = Down(base_ch*2,    base_ch*4, norm=norm, act=act)           # x3
+        self.down3 = Down(base_ch*4,    base_ch*8, norm=norm, act=act)           # x4
 
+        factor = 2 if bilinear else 1
+        self.down4 = Down(base_ch*8,    base_ch*16 // factor, norm=norm, act=act) # x5
+        # NEW: one more level
+        self.down5 = Down(base_ch*16 // factor, base_ch*32 // factor, norm=norm, act=act)  # x6 (deepest)
+
+        # ----- Decoder (5 ups) -----
+        # concat doubles channels at each skip
+        self.up1 = Up(base_ch*32, base_ch*16 // factor, bilinear=bilinear, norm=norm, act=act)  # x6 + x5
+        self.up2 = Up(base_ch*16, base_ch*8  // factor, bilinear=bilinear, norm=norm, act=act)  # + x4
+        self.up3 = Up(base_ch*8,  base_ch*4  // factor, bilinear=bilinear, norm=norm, act=act)  # + x3
+        self.up4 = Up(base_ch*4,  base_ch*2  // factor, bilinear=bilinear, norm=norm, act=act)  # + x2
+        self.up5 = Up(base_ch*2,  base_ch,               bilinear=bilinear, norm=norm, act=act)  # + x1
+
+        self.outc = OutConv(base_ch, 1)
+
+    def forward(self, x):
+        # Encoder
+        x1 = self.inc(x)          # H,   W
+        x2 = self.down1(x1)       # H/2, W/2
+        x3 = self.down2(x2)       # H/4, W/4
+        x4 = self.down3(x3)       # H/8, W/8
+        x5 = self.down4(x4)       # H/16,W/16
+        x6 = self.down5(x5)       # H/32,W/32   (deeper)
+
+        # Decoder
+        x  = self.up1(x6, x5)     # -> H/16
+        x  = self.up2(x,  x4)     # -> H/8
+        x  = self.up3(x,  x3)     # -> H/4
+        x  = self.up4(x,  x2)     # -> H/2
+        x  = self.up5(x,  x1)     # -> H
+        return self.outc(x)
 # ---------------------------
 # Losses & metrics
 # ---------------------------
@@ -763,26 +903,13 @@ def gradient_loss(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch
         gx = F.l1_loss(px, tx); gy = F.l1_loss(py, ty)
     return gx + gy
 
-
 def spectral_loss(pred, target):
-    
     # Upcast to float32 for FFT stability even under AMP
     p32 = pred.float()
     t32 = target.float()
-
     P = torch.fft.rfft2(p32, norm='ortho')
     T = torch.fft.rfft2(t32, norm='ortho')
     return F.mse_loss(torch.abs(P), torch.abs(T))
-
-# def spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-#     B = pred.shape[0]
-#     loss = 0.0
-#     for b in range(B):
-#         p = pred[b:b+1]; t = target[b:b+1]
-#         P = torch.fft.rfft2(p, norm='ortho')
-#         T = torch.fft.rfft2(t, norm='ortho')
-#         loss += F.mse_loss(torch.abs(P), torch.abs(T))
-#     return loss / max(B, 1)
 
 def mass_preservation_penalty(pred_mm: torch.Tensor, target_mm: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     if mask is not None:
@@ -935,17 +1062,12 @@ def safe_collate(batch):
             raise RuntimeError(f"[safe_collate] Non-tensor at pos {i}: types=({type(X)}, {type(Y)}, {type(M)})")
     return default_collate(batch)
 
-
-
 def train(cfg: Config):
     import torch.multiprocessing as mp
     import dask
     mp.set_start_method("spawn", force=True)
 
-    # Recommended stability knobs (you can also put these in your launcher)
-
-        
-    # Process-wide single-threaded dask (reduces cross-process hiccups)
+    # single-threaded dask within each worker/process
     try:
         dask.config.set(scheduler="single-threaded")
     except Exception:
@@ -969,18 +1091,21 @@ def train(cfg: Config):
     else:
         device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         is_main = True
-        
-    if is_main:
-        print(f"[train] out_dir     : {os.path.abspath(cfg.out_dir)}")
-        print(f"[train] ckpt_best   : {os.path.join(cfg.out_dir, cfg.ckpt_name)}")
-        print(f"[train] ckpt_last   : {os.path.join(cfg.out_dir, 'last.pt')}")
-        
-    # --- helpers ---
-    def rlog(msg: str):
-        x=8
-       # print(f"[rank{global_rank}] {msg}", flush=True)
 
-    # CPU/Gloo group for coarse rendezvous (does not touch CUDA streams)
+    if is_main:
+       # print(f"[train] out_dir            : {os.path.abspath(cfg.out_dir)}")
+       # print(f"[train] will save best to  : {os.path.join(cfg.out_dir, cfg.ckpt_name)}")
+       # print(f"[train] will save last to  : {os.path.join(cfg.out_dir, 'last.pt')}")
+        print(f"[train] explicit cfg.ckpt  : {getattr(cfg, 'ckpt', None)}")
+        print(f"[train] coarsen_factor     : {cfg.coarsen_factor}")
+
+    # Bookkeeping for checkpoints/early stop
+    ckpt_best = os.path.join(cfg.out_dir, cfg.ckpt_name)
+    best_val = float('inf')
+    best_epoch = -1
+    patience_ctr = 0
+
+    # CPU/Gloo group for coarse rendezvous
     cpu_pg = None
     if ddp_is_initialized():
         cpu_pg = dist.new_group(backend="gloo")
@@ -993,39 +1118,20 @@ def train(cfg: Config):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
-    # NCCL barrier helper (use *only* for the tight sync before first fwd/bwd)
-    def _barrier_nccl():
-        if ddp_is_initialized():
-            if device.type == "cuda":
-                dist.barrier(device_ids=[device.index])
-            else:
-                dist.barrier()
-
-    # Sync LRs from rank-0 after stepping scheduler
-    def sync_lrs_from_rank0(optimizer):
-        if not ddp_is_initialized():
-            return
-        for pg in optimizer.param_groups:
-            lr_t = torch.tensor([pg['lr']], device=device)
-            dist.broadcast(lr_t, src=0)
-            pg['lr'] = float(lr_t.item())
-
     # --- Datasets ---
     ds_tr = XRRandomPatchDataset(y_paths=cfg.prism_train_paths,
                                  x_paths=cfg.x_train_paths, cfg=cfg, mode="train")
-    ds_va = None  # created only on rank-0
 
-    # --- DataLoaders ---
     dl_tr = DataLoader(
         ds_tr,
         batch_size=cfg.batch_size,
         sampler=None,
         shuffle=False,
-        num_workers=8,
+        num_workers=cfg.num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=False,
-        prefetch_factor=None,
+        persistent_workers=cfg.persistent_workers,
+        prefetch_factor=cfg.prefetch_factor,
         collate_fn=safe_collate
     )
 
@@ -1037,54 +1143,112 @@ def train(cfg: Config):
             ds_va,
             batch_size=cfg.batch_size,
             shuffle=False,
-            num_workers=8,
+            num_workers=cfg.val_num_workers,
             pin_memory=True,
-            persistent_workers=False,
+            persistent_workers=cfg.persistent_workers,
+            prefetch_factor=cfg.prefetch_factor,
             collate_fn=safe_collate
         )
 
     # --- Model ---
-    has_dem = (cfg.use_dem and getattr(ds_tr, "dem", None) is not None)
-    in_ch = 1 + (1 if has_dem else 0) + 1 + 1
+    # Determine DEM availability correctly using dataset attributes
+    has_dem = bool(
+        cfg.use_dem and (
+            getattr(ds_tr, "dem_fine", None) is not None or
+            getattr(ds_tr, "dem_coarse", None) is not None
+        )
+    )
+
+    coarsen_mode = str(getattr(cfg, "coarsen_mode", "mean_max")).lower()
+    n_precip_in = 2 if coarsen_mode == "mean_max" else 1
+
+    # Total input channels: precip*, (+DEM?), mask, climatology
+    in_ch = n_precip_in + (1 if has_dem else 0) + 1 + 1
 
     model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
-    
-    if torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model)
-    
-    model = model.to("cuda")
+    model = model.to(memory_format=torch.channels_last)
 
-    #model = model.to(memory_format=torch.channels_last)
-
-    if ddp_is_initialized():
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[device.index], output_device=device.index,
-            find_unused_parameters=False, gradient_as_bucket_view=True
-        )
-
-    # --- Optimizer & Scheduler & AMP ---
+    # --- Optimizer & Scheduler (create BEFORE loading states) ---
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 
+    amp_warmup_epochs = 5
     def autocast_cm():
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                              enabled=(cfg.amp and device.type == "cuda"))
+        use_amp = (cfg.amp and (epoch > amp_warmup_epochs) and device.type == 'cuda')
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=30, threshold=1e-5
     )
 
-    best_val = float('inf'); best_epoch = -1; patience_ctr = 0
-    ckpt_best = os.path.join(cfg.out_dir, cfg.ckpt_name)
+    # --- Load checkpoint if exists (weights, opt, scheduler) ---
+    start_epoch = 1
     ckpt_last = os.path.join(cfg.out_dir, "last.pt")
+
+    # Preferred explicit ckpt (CLI)
+    explicit_ckpt = getattr(cfg, "ckpt", None)
+
+    def _load_full_training_state(ckpt_obj):
+        nonlocal start_epoch, best_val
+        load_weights_robust(model, ckpt_obj)
+        start_epoch = ckpt_obj.get("epoch", 0) + 1
+        best_val = ckpt_obj.get("best_val", float('inf'))
+        if "optimizer" in ckpt_obj:
+            try:
+                opt.load_state_dict(ckpt_obj["optimizer"])
+            except Exception as e:
+                if is_main: print(f"[resume] optimizer state load failed: {e}")
+        if "scheduler" in ckpt_obj:
+            try:
+                scheduler.load_state_dict(ckpt_obj["scheduler"])
+            except Exception as e:
+                if is_main: print(f"[resume] scheduler state load failed: {e}")
+
+    def _load_weights_only(ckpt_obj):
+        load_weights_robust(model, ckpt_obj)
+
+    ckpt_loaded = False
+
+    # 1) Try explicit --ckpt
+    if explicit_ckpt and os.path.exists(explicit_ckpt):
+        ckpt = torch.load(explicit_ckpt, map_location=device)
+        if isinstance(ckpt, dict) and ("optimizer" in ckpt or "epoch" in ckpt or "model" in ckpt):
+            _load_full_training_state(ckpt)
+        else:
+            _load_weights_only(ckpt)
+        ckpt_loaded = True
+        if is_main:
+            print(f"[resume] Loaded from explicit --ckpt: {explicit_ckpt}")
+
+    # 2) Else try last.pt
+    elif os.path.exists(ckpt_last):
+        ckpt = torch.load(ckpt_last, map_location=device)
+        _load_full_training_state(ckpt)
+        ckpt_loaded = True
+        if is_main:
+            print(f"[resume] Loaded from last checkpoint: {ckpt_last}")
+
+    # 3) Else fresh
+    if not ckpt_loaded and is_main:
+        print("[resume] No checkpoint loaded (fresh training).")
+
+    if is_main and ckpt_loaded:
+        print(f"[resume] Resuming from epoch {start_epoch}, best_val={best_val}")
+
+    # --- Wrap once: DDP if torchrun, else DP as fallback for multi-GPU ---
+    if ddp_is_initialized():
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[device.index], output_device=device.index,
+            find_unused_parameters=False, gradient_as_bucket_view=True
+        )
+    elif torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
 
     # Steps per epoch (lock-step)
     world = world_size if ddp_is_initialized() else 1
     per_rank_bs = cfg.batch_size
     expected_steps = ds_tr.N // (per_rank_bs * world)
- #   if is_main:
- #       print(f"[DDP] ds_tr.N={ds_tr.N}, world={world}, per-rank bs={per_rank_bs}, expected_steps={expected_steps}", flush=True)
 
-    epoch = 1
+    epoch = start_epoch
     stop_training = False
 
     while (epoch <= cfg.epochs) and (not stop_training):
@@ -1143,16 +1307,24 @@ def train(cfg: Config):
             else:
                 data_loss0 = F.l1_loss(Y0_pred_tr * M0, Y0 * M0)
 
-            gl0   = gradient_loss(Y0_pred_tr, Y0, mask=M0) * cfg.w_grad
-            Y0mm  = transform_to_mm(Y0_pred_tr, cfg.transform)
-            T0mm  = transform_to_mm(Y0,         cfg.transform)
-            spec0 = spectral_loss(Y0_pred_tr, Y0) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+            gl0 = gradient_loss(Y0_pred_tr, Y0, mask=M0) * cfg.w_grad
+
+            # Clamp before inverse transform & FP32 fragile ops
+            with torch.autocast(device_type="cuda", enabled=False):
+                Y0_pred_tr_clamped = Y0_pred_tr.clamp(min=0.0, max=12.0).float()
+                Y0mm  = transform_to_mm(Y0_pred_tr_clamped, cfg.transform).float()
+                T0mm  = transform_to_mm(Y0, cfg.transform).float()
+                Y0mm  = torch.nan_to_num(Y0mm, nan=0.0, posinf=0.0, neginf=0.0)
+                T0mm  = torch.nan_to_num(T0mm, nan=0.0, posinf=0.0, neginf=0.0)
+                spec0 = spectral_loss(Y0_pred_tr * M0, Y0 * M0).float() * cfg.w_spec if cfg.w_spec > 0 else torch.tensor(0., device=device)
+
             mass0 = mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass if cfg.w_mass > 0 else 0.0
             hp0   = F.l1_loss(highpass(Y0_pred_tr, 1.5) * M0, highpass(Y0, 1.5) * M0) * cfg.w_hp if cfg.w_hp > 0 else 0.0
             fssl0 = fss_loss(Y0mm, T0mm, cfg.fss_thresholds, cfg.fss_window, M0) * cfg.w_fss if cfg.w_fss > 0 else 0.0
             loss0 = data_loss0 + gl0 + spec0 + mass0 + hp0 + fssl0
             lambda_res = 0.01
             loss0 = loss0 + lambda_res * (delta0 ** 2).mean()
+
         loss0.backward()
         opt.step()
         running += float(loss0.detach())
@@ -1188,6 +1360,15 @@ def train(cfg: Config):
                     c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                 )
 
+            # Fence fragile components in FP32 once; reuse below
+            with torch.autocast(device_type="cuda", enabled=False):
+                Y_pred_tr_clamped = Y_pred_tr.clamp(0.0, 12.0).float()
+                Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform).float()
+                Y_true_mm = transform_to_mm(Y_true, cfg.transform).float()
+                Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
+                Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
+                # Masked FP32 spectral
+                spec = spectral_loss(Y_pred_tr * M, Y_true * M).float() * cfg.w_spec if cfg.w_spec > 0 else torch.tensor(0., device=device)
 
             if cfg.loss == "huber":
                 data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
@@ -1195,42 +1376,37 @@ def train(cfg: Config):
                 data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
 
             gl   = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
-            Y_pred_tr_clamped = Y_pred_tr.clamp(min=0.0, max=12.0)  # 12 ~ expm1(12) ≈ 1.6e5 mm;
-            Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform)
-            Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
-            spec = spectral_loss(Y_pred_tr, Y_true) * cfg.w_spec if cfg.w_spec > 0 else 0.0
             mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
             hp_pred = highpass(Y_pred_tr, sigma=1.5)
             hp_true = highpass(Y_true,    sigma=1.5)
             hp   = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
             fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+
             loss = data_loss + gl + spec + mass + hp + fssl
 
-
-            lambda_res = 0.01  # tune 1e-3..1e-2
+            lambda_res = 0.01
             loss = loss + lambda_res * (delta ** 2).mean()
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # gradient clipping seatbelt
             opt.step()
 
             running += float(loss.detach())
-            if is_main and (isinstance(steps_iter, tqdm)) and (step % log_every == 0):
+            # Use capability check for tqdm (fallback is a lambda)
+            if is_main and hasattr(steps_iter, "set_postfix") and (step % log_every == 0):
                 steps_iter.set_postfix(loss=running / log_every)
                 running = 0.0
 
         del it_tr
 
         # --- Pre-validation rendezvous (all ranks) ---
-     #   rlog(f"E{epoch}: pre-val barrier ENTER")
         _cuda_sync(); cpu_barrier()
-     #   rlog(f"E{epoch}: pre-val barrier EXIT")
 
         # ============================
         # VALIDATION (rank 0 only)
         # ============================
         if is_main and dl_va is not None:
             model.eval()
-           # print(f"[rank{global_rank}] E{epoch}: starting validation", flush=True)
 
             va_losses, va_rmse, va_mae = [], [], []
             fss_scores: Dict[float, List[float]] = {thr: [] for thr in cfg.fss_thresholds}
@@ -1256,7 +1432,9 @@ def train(cfg: Config):
                         data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
 
                     gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
-                    Y_pred_mm = transform_to_mm(Y_pred_tr, cfg.transform)
+
+                    Y_pred_tr_clamped = Y_pred_tr.clamp(min=0.0, max=12.0)
+                    Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform)
                     Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
                     Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
                     Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1276,8 +1454,6 @@ def train(cfg: Config):
                         fss_scores[thr].append(
                             fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
                         )
-
-            print(f"[Val] skipped {skipped_empty} empty-mask batches", flush=True)
 
             if len(va_losses) == 0:
                 mean_val  = float('inf')
@@ -1299,52 +1475,47 @@ def train(cfg: Config):
         else:
             mean_val = float('inf')
 
-
         if is_main:
-            # Step LR scheduler with validation metric
             scheduler.step(mean_val)
-            # Broadcast LR to all ranks so they match rank-0
-            sync_lrs_from_rank0(opt)
+            # Sync LR to other ranks
+            if ddp_is_initialized():
+                for pg in opt.param_groups:
+                    lr_t = torch.tensor([pg['lr']], device=device)
+                    dist.broadcast(lr_t, src=0)
+                    pg['lr'] = float(lr_t.item())
 
-
-        # --- Pre-validation rendezvous (all ranks) ---
-   #     rlog(f"E{epoch}: pre-val barrier ENTER")
+        # --- Rendezvous ---
         _cuda_sync(); cpu_barrier()
-    #    rlog(f"E{epoch}: pre-val barrier EXIT")
-        
-        # --- Validation (rank 0 only) ---
-        if is_main and dl_va is not None:
-            model.eval()
-           # print(f"[rank{global_rank}] E{epoch}: starting validation", flush=True)
-            # validation loop (with empty-mask guard, masked spectral, nan_to_num)...
-        
-        # --- Post-validation rendezvous (all ranks) ---
-   #     rlog(f"E{epoch}: post-val barrier ENTER")
         _cuda_sync(); cpu_barrier()
-   #     rlog(f"E{epoch}: post-val barrier EXIT")
-
 
         # Compute flags on rank-0; broadcast to all
         if is_main:
             improved_flag = int(np.isfinite(mean_val) and (mean_val < best_val - 1e-5))
             planned_best_val = float(min(best_val, mean_val))
-            should_stop_flag = int(epoch >= cfg.min_epochs and patience_ctr >= cfg.patience)
+            # Consider current epoch's lack of improvement in patience planning
+            planned_patience = 0 if improved_flag else (patience_ctr + 1)
+            should_stop_flag = int(epoch >= cfg.min_epochs and planned_patience >= cfg.patience)
         else:
             improved_flag = 0
             planned_best_val = best_val
             should_stop_flag = 0
 
-   #     rlog(f"E{epoch}: broadcast flags ENTER")
         improved_flag    = ddp_broadcast_scalar(improved_flag,    device, torch.int32)
         planned_best_val = ddp_broadcast_scalar(planned_best_val, device, torch.float32)
         should_stop_flag = ddp_broadcast_scalar(should_stop_flag, device, torch.int32)
-        rlog(f"E{epoch}: broadcast flags EXIT")
 
         # Checkpoint rank-0 only
         if is_main:
-   #         rlog(f"E{epoch}: checkpoint SAVE ENTER")
             state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-            torch.save({"model": state_dict, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}, ckpt_last)
+            torch.save({
+                "model": state_dict,
+                "optimizer": opt.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "best_val": best_val,
+                "cfg": asdict(cfg)
+            }, ckpt_last)
+
             if improved_flag:
                 best_val = planned_best_val
                 best_epoch = epoch
@@ -1353,12 +1524,9 @@ def train(cfg: Config):
                 print("  ↳ Saved new best checkpoint:", os.path.abspath(ckpt_best), flush=True)
             else:
                 patience_ctr += 1
-       #     rlog(f"E{epoch}: checkpoint SAVE EXIT")
 
         # End-of-epoch rendezvous (all ranks)
-     #   rlog(f"E{epoch}: end-of-epoch barrier ENTER")
         _cuda_sync(); cpu_barrier()
-     #   rlog(f"E{epoch}: end-of-epoch barrier EXIT")
 
         # Early stop / epoch++
         if should_stop_flag:
@@ -1367,15 +1535,12 @@ def train(cfg: Config):
             stop_training = True
         else:
             epoch += 1
-            if is_main:
-                rlog(f"ADVANCING TO E{epoch}")
 
     # Final sync & cleanup
     _cuda_sync(); cpu_barrier()
     if is_main:
         print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best), flush=True)
     ddp_cleanup()
-
 
 # ---------------------------
 # Inference (single-process by default)
@@ -1391,15 +1556,13 @@ def tile_infer(cfg: Config, model: nn.Module, X: torch.Tensor, M: torch.Tensor, 
             y1 = min(y0 + tile, H); x1 = min(x0 + tile, W)
             ys = slice(y0, y1); xs = slice(x0, x1)
             patch = X[..., ys, xs]
-            
-            M_p = M[..., ys, xs]                      # slice true mask
+            M_p = M[..., ys, xs]
             with torch.no_grad():
                 delta = model(patch)
                 y_patch = apply_residual_gate_in_tr_space(
                     X_tr=patch[:, 0:1], delta_tr=delta, M=M_p,
                     c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                 )
-
             out[..., ys, xs] += y_patch
             weight[..., ys, xs] += 1.0
     out = out / weight.clamp_min(1.0)
@@ -1437,21 +1600,23 @@ def infer_on_stack(cfg: Config, ckpt_path: str, pre_paths: List[str], out_path: 
         clim_daily = np.load(cfg.climatology_npy, mmap_mode="r")
         if clim_daily.ndim != 3 or clim_daily.shape[0] != 366:
             raise ValueError(f"climatology_npy must be [366,H,W], got {clim_daily.shape}")
-    
+
     domain_mask = None
     if getattr(cfg, "domain_mask_npy", None):
         domain_mask = np.load(cfg.domain_mask_npy, mmap_mode="r").astype(np.float32)
 
-    # If not provided, derive domain mask from daily climatology; else from pre_all (fallback)
     if domain_mask is None:
         if clim_daily is not None:
             domain_mask = np.isfinite(clim_daily).any(axis=0).astype(np.float32)  # [H,W]
         else:
             domain_mask = np.isfinite(pre_all).any(axis=0).astype(np.float32)     # fallback
-    
-    # We will build clim_tr PER-TIME (by DOY) below, so no global clim_t her
 
-    chans = 1 + (1 if dem is not None else 0) + 1 + 1
+    # IMPORTANT: match training config from checkpoint
+    has_dem = bool(model_cfg.use_dem)
+    coarsen_mode = str(getattr(model_cfg, "coarsen_mode", "mean_max")).lower()
+    n_precip_in = 2 if coarsen_mode == "mean_max" else 1
+    chans = n_precip_in + (1 if has_dem else 0) + 1 + 1
+
     model = ClimateUNet(in_ch=chans, base_ch=model_cfg.base_ch).to(device)
     _state = ckpt["model"] if "model" in ckpt else ckpt
     _exp_in = _expected_in_channels_from_state(_state)
@@ -1485,81 +1650,99 @@ def infer_on_stack(cfg: Config, ckpt_path: str, pre_paths: List[str], out_path: 
         T = y_mm_np.shape[0]
         corrected = np.zeros_like(y_mm_np, dtype=np.float32)
 
-        for t in tqdm(range(T), desc=os.path.basename(p)):
+        for t in tqdm(range(T), desc=os.path.basename(p)):  # time loop
             y_mm = y_mm_np[t]
             y_mm = np.where(np.isfinite(y_mm), y_mm, 0.0).astype(np.float32)
             y_mm = np.clip(y_mm, 0.0, 1e5)
-            y_t = torch.from_numpy(y_mm)[None, None, ...].to(device)
 
             if x_mm_np is not None:
-                x_mm = x_mm_np[t]
-                x_mm = np.where(np.isfinite(x_mm), x_mm, 0.0).astype(np.float32)
-                x_mm = np.clip(x_mm, 0.0, 1e5)
-                x_tr = mm_to_transform(torch.from_numpy(x_mm)[None, None, ...].float().to(device),
-                                       model_cfg.transform)
+                src_precip_fine = np.where(np.isfinite(x_mm_np[t]), x_mm_np[t], 0.0).astype(np.float32)
             else:
-                x_mm = apply_degradation(y_t, model_cfg)
-                x_tr = mm_to_transform(x_mm, model_cfg.transform)
-            
-           # m_data = (np.isfinite(y_mm)).astype(np.float32)
-            m_data = valid_mask(y_mm, sentinel=-9999.0)
-            m = (m_data * domain_mask).astype(np.float32)
-            mask_t = torch.from_numpy(m)[None, None, ...].to(device)
-            x_tr = x_tr * mask_t
-            # Build daily climatology channel for this time (by DOY)
-            # We need a day-of-year index 0..365 from the 'times' coordinate
+                y_t_tensor = torch.from_numpy(y_mm)[None, None, ...].to(device)
+                src_precip_fine = apply_degradation(y_t_tensor, model_cfg).squeeze().detach().cpu().numpy().astype(np.float32)
+
+            m_data  = valid_mask(y_mm, sentinel=-9999.0)
+            m_fine  = (m_data * domain_mask).astype(np.float32)
+
             try:
-                # times is a numpy datetime64 array from xarray, shape [T]
                 doy_t = int(np.datetime64(times[t], 'D').astype('datetime64[D]').astype(object).timetuple().tm_yday) - 1
             except Exception:
-                # More robust: use xarray accessor on the slice (cheap)
                 doy_t = int(xr.DataArray(times[t]).dt.dayofyear.values) - 1
-            
+
             if clim_daily is not None:
                 clim_crop = clim_daily[doy_t, :, :].astype(np.float32)
             else:
-                # Fallback: zero clim if none provided
                 clim_crop = np.zeros((H, W), dtype=np.float32)
-
-            # NEW: sanitize
             clim_crop = np.where(np.isfinite(clim_crop), clim_crop, 0.0).astype(np.float32)
 
-            clim_tr = 0.1 * mm_to_transform(
-                torch.from_numpy(clim_crop)[None, ...].float(),
-                model_cfg.transform
-            ).to(device)
+            f         = int(getattr(model_cfg, "coarsen_factor", 1))
+            mask_thr  = float(getattr(model_cfg, "coarsen_mask_threshold", 0.5))
+            use_log1p = bool(getattr(model_cfg, "precip_log1p", False))
 
-            clim_tr = clim_tr * mask_t
- 
-            # Assemble channels
-            chans_list = [x_tr.squeeze(0)]
-            if dem is not None:
-                dem_n = (dem - np.nanmean(dem)) / (np.nanstd(dem) + 1e-6)
-                dem_n = np.where(np.isnan(dem_n), 0.0, dem_n)
-                chans_list.append(torch.from_numpy(dem_n)[None, ...].to(device))
-            chans_list.append(mask_t.squeeze(0))
-            chans_list.append(clim_tr.squeeze(0).to(device))
-            X = torch.cat(chans_list, dim=0).unsqueeze(0)
+            if f > 1:
+                x_mean_np, x_max_np = _block_reduce_mean_max(src_precip_fine, f)
+                m_coarse, _         = _block_reduce_mask_fraction(m_fine.astype(np.float32), f, mask_thr)
+                clim_coarse         = _block_reduce_mean(clim_crop.astype(np.float32), f)
+                dem_use = dem
+                if dem_use is not None:
+                    dem_use = _block_reduce_mean(dem_use.astype(np.float32), f)
+            else:
+                x_mean_np = src_precip_fine
+                x_max_np  = src_precip_fine
+                m_coarse  = m_fine
+                clim_coarse = clim_crop
+                dem_use = dem
+
+            if use_log1p:
+                x_mean_np = np.log1p(np.clip(x_mean_np, 0.0, 1e6)).astype(np.float32)
+                x_max_np  = np.log1p(np.clip(x_max_np,  0.0, 1e6)).astype(np.float32)
+
+            x_mean_t  = torch.from_numpy(np.where(m_coarse > 0.5, x_mean_np, 0.0))[None, ...].to(device)
+            x_max_t   = torch.from_numpy(np.where(m_coarse > 0.5, x_max_np,  0.0))[None, ...].to(device)
+            x_mean_tr = mm_to_transform(x_mean_t, model_cfg.transform).float()
+            x_max_tr  = mm_to_transform(x_max_t,  model_cfg.transform).float()
+
+            mask_full = torch.from_numpy(m_coarse)[None, None, ...].to(device)  # [1,1,Hc,Wc]
+            mask_ch   = mask_full.squeeze(0)                                    # [1,Hc,Wc]
+
+            clim_tr = 0.1 * mm_to_transform(torch.from_numpy(clim_coarse)[None, ...].float(),
+                                            model_cfg.transform).to(device)
+            clim_tr = clim_tr * mask_ch
+
+            dem_ch = None
+            if dem_use is not None:
+                dem_n = (dem_use - np.nanmean(dem_use)) / (np.nanstd(dem_use) + 1e-6)
+                dem_n = np.where(np.isfinite(dem_n), dem_n, 0.0).astype(np.float32)
+                dem_ch = torch.from_numpy(dem_n)[None, ...].to(device)
+
+            chans_list = [x_mean_tr, x_max_tr]
+            if dem_ch is not None:
+                chans_list.append(dem_ch)
+            chans_list.append(mask_ch)
+            chans_list.append(clim_tr)
+
+            X = torch.cat(chans_list, dim=0).unsqueeze(0)  # [1, C, Hc, Wc]
+            mask_t = mask_full
 
             if max(H, W) > model_cfg.tile:
-                y_pred_tr = tile_infer(cfg, model, X, mask_t, tile=model_cfg.tile, overlap=model_cfg.tile_overlap)
+                y_pred_tr = tile_infer(model_cfg, model, X, mask_t, tile=model_cfg.tile, overlap=model_cfg.tile_overlap)
             else:
-
                 with torch.no_grad():
                     delta = model(X)
-                    # You already computed mask_t earlier (shape [1,1,H,W])
                     y_pred_tr = apply_residual_gate_in_tr_space(
                         X_tr=X[:, 0:1], delta_tr=delta, M=mask_t,
-                        c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                        c=model_cfg.gate_c, beta=model_cfg.gate_beta, alpha_bg=model_cfg.gate_alpha_bg
                     )
+
             y_pred_mm = transform_to_mm(y_pred_tr, model_cfg.transform)
             y_pred_mm = torch.clamp(y_pred_mm, min=0.0)
             y_pred_mm = y_pred_mm * mask_t
 
-            # Mass rescale disabled by default here (scale=1.0)
-            scale = 1.0
-            y_pred_mm = y_pred_mm * scale
-            corrected[t] = y_pred_mm.squeeze().detach().cpu().numpy()
+            if f > 1:
+                y_pred_mm_up = F.interpolate(y_pred_mm, size=(H, W), mode='bilinear', align_corners=False)
+                corrected[t] = y_pred_mm_up.squeeze().detach().cpu().numpy().astype(np.float32)
+            else:
+                corrected[t] = y_pred_mm.squeeze().detach().cpu().numpy().astype(np.float32)
 
         out_times.append(times)
         out_days.append(corrected)
@@ -1619,18 +1802,23 @@ def build_arg_parser():
     ap.add_argument("--out_path",    type=str, default="./corrected_pre2001.nc")
 
     ap.add_argument("--batch_size", type=int, help="Per-GPU batch size for training.")
-    
     ap.add_argument("--steps_per_epoch", type=int, default=None)
     ap.add_argument("--val_steps", type=int, default=None)
-       
-    # in build_arg_parser()
+    ap.add_argument("--patch", type=int, default=None, help="Per-GPU patch size for training.")
+
     ap.add_argument("--climatology_npy", type=str, default=None, help="Daily climatology .npy [366,H,W].")
     ap.add_argument("--domain_mask_npy", type=str, default=None, help="Domain mask .npy [H,W] (0/1).")
-
 
     ap.add_argument("--out_dir", type=str, default=None, help="Directory to write training outputs (config, ckpts).")
     ap.add_argument("--ckpt_name", type=str, default=None, help="Filename for best checkpoint (default: best.pt).")
 
+    ap.add_argument("--timeslice_cache", type=int, default=12, help="In process cache - impacts the amount of RAM.")
+
+    # Dataloader tuning CLI
+    ap.add_argument("--num_workers", type=int, default=None, help="Number of DataLoader workers per process ")
+    ap.add_argument("--val_num_workers", type=int, default=None, help="Validation DataLoader workers (rank 0).")
+    ap.add_argument("--prefetch_factor", type=int, default=None, help="Batches prefetched per worker (default: PyTorch default).")
+    ap.add_argument("--persistent_workers", action="store_true", help="Keep DataLoader workers alive across epochs.")
     return ap
 
 def main():
@@ -1659,35 +1847,44 @@ def main():
     if args.out_path:      cfg.out_path  = args.out_path
     if args.ckpt:          cfg.ckpt      = args.ckpt
 
+    if args.timeslice_cache is not None:
+        cfg.timeslice_cache = args.timeslice_cache
+
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
-        
-        
+
+    if args.patch is not None:
+        cfg.patch = args.patch    
+
     # world size before ddp_setup() may be unavailable; use env if present
     world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
     bs = cfg.batch_size
-    
+
     if args.steps_per_epoch is not None:
         cfg.train_crops_per_epoch = args.steps_per_epoch * bs * world_size_env
     if args.val_steps is not None:
         cfg.val_crops_per_epoch   = args.val_steps * bs  # val runs only on rank 0
 
-
     if args.climatology_npy: cfg.climatology_npy = args.climatology_npy
     if args.domain_mask_npy: cfg.domain_mask_npy = args.domain_mask_npy
 
-  #  cfg.train_crops_per_epoch = max(cfg.batch_size * (dist.get_world_size() if ddp_is_initialized() else 1) * 8, 64)
-  #  cfg.val_crops_per_epoch   = 64
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
+    if args.val_num_workers is not None:
+        cfg.val_num_workers = args.val_num_workers
+    if args.prefetch_factor is not None:
+        cfg.prefetch_factor = args.prefetch_factor
+    if args.persistent_workers:
+        cfg.persistent_workers = True
 
     if args.out_dir:
         cfg.out_dir = args.out_dir
     if args.ckpt_name:
         cfg.ckpt_name = args.ckpt_name
 
-    if args.mode == "train" :
+    if args.mode == "train":
         assert cfg.prism_train_paths and cfg.prism_val_paths, "Provide --train_paths and --val_paths"
         train(cfg)
-
     elif args.mode == "infer":
         assert args.ckpt and args.pre_paths, "Provide --ckpt and --pre_paths"
         cfg.x_pre_paths = args.x_pre_paths if args.x_pre_paths else None

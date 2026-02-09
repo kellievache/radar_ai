@@ -8,6 +8,11 @@
 netcdf/
 unet_radar_correction2.py
 unet_radar_correction3.py
+unet_radar_correction4.py
+unet_radar_correction5.py
+older/
+models/
+
 
 
 # User-specific files
