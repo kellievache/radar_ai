@@ -845,7 +845,7 @@ class ClimateUNet(nn.Module):
         x = self.up4(x,  x1)
         return self.outc(x)
     
-    
+
 class ClimateUNet5(nn.Module):
     def __init__(self, in_ch, base_ch=64, norm='batch', act='silu', bilinear=True):
         super().__init__()

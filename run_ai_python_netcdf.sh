@@ -15,7 +15,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 
-python unet_radar_correction6.py \
+python unet_radar_correction.py \
   --mode train \
   --ckpt /nfs/pancake/u5/projects/vachek/radar_ai/models/best_production_800a.pt \
   --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train_opt.zarr \
@@ -29,6 +29,9 @@ python unet_radar_correction6.py \
   --num_workers 12 \
   --val_num_workers 6 \
   --prefetch_factor 3 \
+  --biased_crops \
+  --biased_policy precip \
+  --biased_warmup_epochs  2 \
  
   --timeslice_cache 256 \
   --patch 896 \
