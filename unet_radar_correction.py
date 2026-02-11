@@ -21,7 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import time
-
+# --- add at top of file if not already there
+import torch.nn.functional as F
 try:
     import xarray as xr  # NetCDF/Zarr I/O
 except ImportError:
@@ -974,6 +975,59 @@ class ClimateUNet(nn.Module):
         x = self.up4(x,  x1)
         return self.outc(x)
 
+
+class ClimateUNet5(nn.Module):
+    def __init__(self, in_ch, base_ch=64, norm='batch', act='silu', bilinear=True, deep_supervision=True):
+        super().__init__()
+        self.deep_supervision = deep_supervision
+        self.inc   = ConvBlock(in_ch, base_ch, norm=norm, act=act)
+        self.down1 = Down(base_ch,      base_ch*2, norm=norm, act=act)
+        self.down2 = Down(base_ch*2,    base_ch*4, norm=norm, act=act)
+        self.down3 = Down(base_ch*4,    base_ch*8, norm=norm, act=act)
+        factor = 2 if bilinear else 1
+        self.down4 = Down(base_ch*8,    base_ch*16 // factor, norm=norm, act=act)
+
+        self.up1 = Up(base_ch*16, base_ch*8  // factor, bilinear=bilinear, norm=norm, act=act)  # -> H/8
+        self.up2 = Up(base_ch*8,  base_ch*4  // factor, bilinear=bilinear, norm=norm, act=act)  # -> H/4
+        self.up3 = Up(base_ch*4,  base_ch*2  // factor, bilinear=bilinear, norm=norm, act=act)  # -> H/2
+        self.up4 = Up(base_ch*2,  base_ch,               bilinear=bilinear, norm=norm, act=act)  # -> H
+
+        # main head (residual delta in transform space)
+        self.outc = OutConv(base_ch, 1)
+
+        # ---------------------------
+        # Deep supervision heads
+        # ---------------------------
+        if self.deep_supervision:
+            # up1 output channels = base_ch*8//factor, up2 output = base_ch*4//factor
+            self.aux1 = OutConv(base_ch*8  // factor, 1)  # deepest decoder feature (H/8)
+            self.aux2 = OutConv(base_ch*4  // factor, 1)  # mid decoder feature    (H/4)
+
+    def forward(self, x):
+        # Encoder
+        x1 = self.inc(x)     # H
+        x2 = self.down1(x1)  # H/2
+        x3 = self.down2(x2)  # H/4
+        x4 = self.down3(x3)  # H/8
+        x5 = self.down4(x4)  # H/16
+
+        # Decoder (collect intermediate features for aux heads)
+        x  = self.up1(x5, x4)      # H/8
+        feat_up1 = x               # save for aux1
+        x  = self.up2(x,  x3)      # H/4
+        feat_up2 = x               # save for aux2
+        x  = self.up3(x,  x2)      # H/2
+        x  = self.up4(x,  x1)      # H
+        main_delta = self.outc(x)  # [B,1,H,W] residual (transform space)
+
+        if not self.training or not self.deep_supervision:
+            return main_delta
+
+        # Aux residuals (transform space), lower resolution than main
+        aux_delta1 = self.aux1(feat_up1)  # [B,1,H/8,W/8]
+        aux_delta2 = self.aux2(feat_up2)  # [B,1,H/4,W/4]
+        # Return a tuple: main, dict of aux outputs
+        return main_delta, {"aux1": aux_delta1, "aux2": aux_delta2}
 # ---------------------------
 # Losses & metrics
 # ---------------------------
@@ -1180,15 +1234,21 @@ def train(cfg: Config):
         device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         is_main = True
 
-    if is_main:
-       # print(f"[train] out_dir            : {os.path.abspath(cfg.out_dir)}")
-       # print(f"[train] will save best to  : {os.path.join(cfg.out_dir, cfg.ckpt_name)}")
-       # print(f"[train] will save last to  : {os.path.join(cfg.out_dir, 'last.pt')}")
-        print(f"[train] explicit cfg.ckpt  : {getattr(cfg, 'ckpt', None)}")
-        print(f"[train] coarsen_factor     : {cfg.coarsen_factor}")
+    # Resolve save paths (filenames under out_dir)
+    best_name = getattr(cfg, "best_name", None) or "best.pt"
+    last_name = getattr(cfg, "last_name", None) or "last.pt"
+    ckpt_best = os.path.join(cfg.out_dir, best_name)
+    ckpt_last = os.path.join(cfg.out_dir, last_name)
 
-    # Bookkeeping for checkpoints/early stop
-    ckpt_best = os.path.join(cfg.out_dir, cfg.ckpt_name)
+    # Preferred explicit resume path (full path)
+    resume_from = getattr(cfg, "resume_from", None)
+
+    if is_main:
+        print(f"[train] out_dir            : {os.path.abspath(cfg.out_dir)}")
+        print(f"[train] resume_from       : {cfg.resume_from or 'None'}")
+        print(f"[train] will save best to : {os.path.join(cfg.out_dir, cfg.best_name)}")
+        print(f"[train] will save last to : {os.path.join(cfg.out_dir, cfg.last_name)}")
+
     best_val = float('inf')
     best_epoch = -1
     patience_ctr = 0
@@ -1239,7 +1299,6 @@ def train(cfg: Config):
         )
 
     # --- Model ---
-    # Determine DEM availability correctly using dataset attributes
     has_dem = bool(
         cfg.use_dem and (
             getattr(ds_tr, "dem_fine", None) is not None or
@@ -1270,10 +1329,6 @@ def train(cfg: Config):
 
     # --- Load checkpoint if exists (weights, opt, scheduler) ---
     start_epoch = 1
-    ckpt_last = os.path.join(cfg.out_dir, "last.pt")
-
-    # Preferred explicit ckpt (CLI)
-    explicit_ckpt = getattr(cfg, "ckpt", None)
 
     def _load_full_training_state(ckpt_obj):
         nonlocal start_epoch, best_val
@@ -1296,18 +1351,18 @@ def train(cfg: Config):
 
     ckpt_loaded = False
 
-    # 1) Try explicit --ckpt
-    if explicit_ckpt and os.path.exists(explicit_ckpt):
-        ckpt = torch.load(explicit_ckpt, map_location=device)
+    # 1) Try explicit --resume_from (full path)
+    if resume_from and os.path.exists(resume_from):
+        ckpt = torch.load(resume_from, map_location=device)
         if isinstance(ckpt, dict) and ("optimizer" in ckpt or "epoch" in ckpt or "model" in ckpt):
             _load_full_training_state(ckpt)
         else:
             _load_weights_only(ckpt)
         ckpt_loaded = True
         if is_main:
-            print(f"[resume] Loaded from explicit --ckpt: {explicit_ckpt}")
+            print(f"[resume] Loaded from --resume_from: {resume_from}")
 
-    # 2) Else try last.pt
+    # 2) Else try <out_dir>/<last_name>
     elif os.path.exists(ckpt_last):
         ckpt = torch.load(ckpt_last, map_location=device)
         _load_full_training_state(ckpt)
@@ -1345,8 +1400,6 @@ def train(cfg: Config):
 
         if hasattr(ds_tr, "reseed"):
             ds_tr.reseed(cfg.seed, epoch, global_rank)
-        #Call set_epoch(epoch) immediately after reseeding (reseed) and before the first batch is pulled.
-        #That ensures every worker process uses the epoch number for your sampler logic for the entire epoch.
         if hasattr(ds_tr, "set_epoch"):
             ds_tr.set_epoch(epoch)
 
@@ -1446,51 +1499,11 @@ def train(cfg: Config):
                     X = torch.cat([x_tr, X[:, 1:]], dim=1)
 
             with autocast_cm():
-                #delta - How much should the raw input precip be adjusted at each pixel, in transformed space,
-                #to correct biases, structure, intensity, etc
-#                🔷 2. Why predict δ instead of predicting Y directly?
-                        #This is the most important design choice in your entire system.
-                        #✔️ Stabilizes learning
-                        #Predicting absolute precipitation from scratch is hard — magnitudes vary from 0 to hundreds of mm.
-                        #Predicting a correction on top of an existing field is much easier and keeps loss scales stable.
-                        #✔️ Physically meaningful
-                        #Your input X is a noisy or degraded precipitation estimate (coarsened radar or degraded PRISM).
-                        #Correcting X is physically grounded:#
-                        #
-                        #preserves global structure
-                        #preserves “mass” more naturally
-                        #avoids unphysical artifacts
-                        #
-                        #✔️ Much easier for the network
-                        #The model doesn't need to learn precipitation from zero.
-                        #It only learns “how to fix what's wrong.”
                 delta = model(X)
-
-                
                 Y_pred_tr = apply_residual_gate_in_tr_space(
                     X_tr=X[:, 0:1], delta_tr=delta, M=M,
                     c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                 )
-
-                #This gate:
-                        #✔ prevents huge δ corrections
-                        #Because model can make large errors early → gate keeps corrections sane.
-                       # ✔ allows bigger corrections where X is small
-                        #Small base precipitation often needs bigger % corrections.
-                       # ✔ enforces some structure outside domain
-                        #The gate looks like (conceptually):
-                        #residual_weight = sigmoid(β * (c - X_tr))
-
-                        #Y_pred_tr = X_tr + residual_weight * δ
-
-                        #Meaning:
-
-                        #Where X_tr is high → residual_weight small (don't destroy high-intensity structure)
-                        #Where X_tr is low → allow larger corrections
-                        #Outside domain → α_bg can cap or relax corrections
-                        #Everywhere else → correction behavior is smooth and stable
-
-                        #This rescues training from large δ explosions seen in early epochs.
 
             # Fence fragile components in FP32 once; reuse below
             with torch.autocast(device_type="cuda", enabled=False):
@@ -1524,7 +1537,6 @@ def train(cfg: Config):
             opt.step()
 
             running += float(loss.detach())
-            # Use capability check for tqdm (fallback is a lambda)
             if is_main and hasattr(steps_iter, "set_postfix") and (step % log_every == 0):
                 steps_iter.set_postfix(loss=running / log_every)
                 running = 0.0
@@ -1624,7 +1636,6 @@ def train(cfg: Config):
         if is_main:
             improved_flag = int(np.isfinite(mean_val) and (mean_val < best_val - 1e-5))
             planned_best_val = float(min(best_val, mean_val))
-            # Consider current epoch's lack of improvement in patience planning
             planned_patience = 0 if improved_flag else (patience_ctr + 1)
             should_stop_flag = int(epoch >= cfg.min_epochs and planned_patience >= cfg.patience)
         else:
@@ -1639,6 +1650,8 @@ def train(cfg: Config):
         # Checkpoint rank-0 only
         if is_main:
             state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+
+            # Save "last" with full training state (for exact resume)
             torch.save({
                 "model": state_dict,
                 "optimizer": opt.state_dict(),
@@ -1652,7 +1665,13 @@ def train(cfg: Config):
                 best_val = planned_best_val
                 best_epoch = epoch
                 patience_ctr = 0
-                torch.save({"model": state_dict, "cfg": asdict(cfg), "epoch": epoch, "best_val": best_val}, ckpt_best)
+                # Save "best" with weights-only (for inference/warm-start)
+                torch.save({
+                    "model": state_dict,
+                    "cfg": asdict(cfg),
+                    "epoch": epoch,
+                    "best_val": best_val
+                }, ckpt_best)
                 print("  ↳ Saved new best checkpoint:", os.path.abspath(ckpt_best), flush=True)
             else:
                 patience_ctr += 1
@@ -1673,7 +1692,6 @@ def train(cfg: Config):
     if is_main:
         print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best), flush=True)
     ddp_cleanup()
-
 # ---------------------------
 # Inference (single-process by default)
 # ---------------------------
@@ -1703,8 +1721,11 @@ def tile_infer(cfg: Config, model: nn.Module, X: torch.Tensor, M: torch.Tensor, 
 def infer_on_stack(cfg: Config, ckpt_path: str, pre_paths: List[str], out_path: str,
                    static_dem_path: Optional[str] = None, static_mask_path: Optional[str] = None):
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    assert cfg.ckpt_path, "Inference requires --ckpt_path (full path to the checkpoint)."
     ckpt = torch.load(ckpt_path, map_location=device)
     model_cfg = Config(**sanitize_cfg_dict(ckpt["cfg"]))
+
+    print(f"[infer] ckpt_path          : {cfg.ckpt_path}")
 
     if xr is None:
         raise RuntimeError("xarray required for inference I/O.")
@@ -1927,7 +1948,17 @@ def build_arg_parser():
 
     ap.add_argument("--static_dem",  type=str, default=None)
     ap.add_argument("--static_mask", type=str, default=None)
-    ap.add_argument("--ckpt",        type=str, default=None)
+
+    
+    # ------------- argparse (train/infer) -------------
+    ap.add_argument("--out_dir", type=str, default=None, help="Directory to write training outputs (config, ckpts).")
+    ap.add_argument("--resume_from", type=str, default=None, help="Full path to checkpoint to resume TRAINING from (weights-only also OK).")
+    ap.add_argument("--ckpt_path", type=str, default=None, help="Full path to checkpoint to use for INFERENCE.")
+    # Keep current names, but mark as deprecated (compat shim)
+    ap.add_argument("--ckpt", type=str, default=None, help="[DEPRECATED] Use --resume_from for training, --ckpt_path for inference.")
+    ap.add_argument("--ckpt_name", type=str, default=None, help="[DEPRECATED] Use --best_name.")
+    ap.add_argument("--best_name", type=str, default=None, help="Filename for the best checkpoint under out_dir (default: best.pt).")
+    ap.add_argument("--last_name", type=str, default=None, help="Filename for the last checkpoint under out_dir (default: last.pt).")
 
     ap.add_argument("--pre_paths",   type=str, nargs="*", help="Files used for mask/clim/iteration in inference.")
     ap.add_argument("--x_pre_paths", type=str, nargs="*", help="Files used as X in inference; if omitted, X=degraded Y.")
@@ -1940,10 +1971,6 @@ def build_arg_parser():
 
     ap.add_argument("--climatology_npy", type=str, default=None, help="Daily climatology .npy [366,H,W].")
     ap.add_argument("--domain_mask_npy", type=str, default=None, help="Domain mask .npy [H,W] (0/1).")
-
-    ap.add_argument("--out_dir", type=str, default=None, help="Directory to write training outputs (config, ckpts).")
-    ap.add_argument("--ckpt_name", type=str, default=None, help="Filename for best checkpoint (default: best.pt).")
-
     ap.add_argument("--timeslice_cache", type=int, default=12, help="In process cache - impacts the amount of RAM.")
 
     # Dataloader tuning CLI
@@ -1951,6 +1978,10 @@ def build_arg_parser():
     ap.add_argument("--val_num_workers", type=int, default=None, help="Validation DataLoader workers (rank 0).")
     ap.add_argument("--prefetch_factor", type=int, default=None, help="Batches prefetched per worker (default: PyTorch default).")
     ap.add_argument("--persistent_workers", action="store_true", help="Keep DataLoader workers alive across epochs.")
+
+    ap.add_argument("--biased_crops", type=int, default=None, help="N ")
+    ap.add_argument("--biased_policy", type=int, default=None, help="Va")
+    ap.add_argument("--biased_warmup_epochs", type=int, default=None, help="")
     return ap
 
 def main():
@@ -2005,13 +2036,28 @@ def main():
     if args.out_dir: cfg.out_dir = args.out_dir
     if args.ckpt_name: cfg.ckpt_name = args.ckpt_name
 
+
+    # Load-from flags (TRAIN resume vs INFER ckpt)
+    cfg.resume_from = args.resume_from
+    cfg.ckpt_path   = args.ckpt_path
+
+    # Back-compat: if user passed --ckpt
+    if args.ckpt and not cfg.resume_from and cfg.mode == "train": cfg.resume_from = args.ckpt
+    if args.ckpt and not cfg.ckpt_path and cfg.mode == "infer": cfg.ckpt_path = args.ckpt
+
+    # Save-as names
+    cfg.best_name = args.best_name or args.ckpt_name or "best.pt"
+    cfg.last_name = args.last_name or "last.pt"
+
+
+
     if args.mode == "train":
         assert cfg.prism_train_paths and cfg.prism_val_paths, "Provide --train_paths and --val_paths"
         train(cfg)
     elif args.mode == "infer":
-        assert args.ckpt and args.pre_paths, "Provide --ckpt and --pre_paths"
+        assert args.ckpt_path and args.pre_paths, "Provide --ckpt and --pre_paths"
         cfg.x_pre_paths = args.x_pre_paths if args.x_pre_paths else None
-        infer_on_stack(cfg, args.ckpt, args.pre_paths, args.out_path,
+        infer_on_stack(cfg, args.ckpt_path, args.pre_paths, args.out_path,
                        static_dem_path=args.static_dem, static_mask_path=args.static_mask)
 
 if __name__ == "__main__":
