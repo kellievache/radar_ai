@@ -239,7 +239,7 @@ class Config:
     epochs: int = 200
     min_epochs: int = 10
     batch_size: int = 8    # per-GPU in DDP
-    learning_rate: float = 2e-4
+    learning_rate: float = 1e-4
     weight_decay: float = 1e-4
     base_ch: int = 96
     num_workers: int = 8
@@ -286,10 +286,12 @@ class Config:
     # Training from spatial crops
     patch: int = 768
     train_crops_per_epoch: int = 20000
-    val_crop_mode: str = "random"
+    #use tile to fix tiling so validation uses the same spatial windows.  This helps reduce high epoch variance in val metrics and makes it easier to see real trends.
+    val_crop_mode: str = "tile"
     val_crops_per_epoch: int = 4000
-    val_tile: Optional[int] = None
-    val_tile_overlap: Optional[int] = None
+    #match tile size for validation if using tile mode, otherwise use patch size.  This is just to keep the number of crops per epoch consistent and avoid high variance in val metrics.
+    val_tile: Optional[int] = 896
+    val_tile_overlap: Optional[int] = 192
 
     # Do heavy degr ops on GPU in train loop instead of dataset
     degrade_in_dataset: bool = False
@@ -308,6 +310,9 @@ class Config:
     coarsen_mode = "mean_max"      # adds both mean and max precip as input channels
     coarsen_mask_threshold = 0.5
     precip_log1p = True
+    biased_crops: bool = True
+    biased_policy: str = "precip"
+    biased_warmup_epochs: int = 2
 
     def __post_init__(self):
         if self.fss_thresholds is None:
@@ -386,6 +391,10 @@ def add_noise_transformed(z: torch.Tensor, std: float) -> torch.Tensor:
         return z
     return z + torch.randn_like(z) * std
 
+# ---------------------------
+# Distributed Data Parallel
+# ---------------------------
+
 def _cuda_sync(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -396,6 +405,10 @@ def _barrier(device):
             dist.barrier(device_ids=[device.index])
         else:
             dist.barrier()
+
+# ---------------------------
+# Aggregation
+# ---------------------------            
 
 def _block_reduce_mean_max(arr: np.ndarray, f: int):
     """
@@ -563,7 +576,8 @@ class XRRandomPatchDataset(Dataset):
         # Length & sampler
         if mode == "train":
             self.N = int(getattr(cfg, "train_crops_per_epoch", 20000))
-            self._sampler = self._random_sampler
+            #self._sampler = self._random_sampler
+            self._sampler = self._hybrid_sampler  # instead of self._random_sampler
             self._rng = random.Random(cfg.seed)
         else:
             val_mode = getattr(cfg, "val_crop_mode", "random").lower()
@@ -577,6 +591,11 @@ class XRRandomPatchDataset(Dataset):
                 self.N = int(getattr(cfg, "val_crops_per_epoch", 4000))
                 self._sampler = self._random_sampler
                 self._rng = random.Random(cfg.seed + 1)
+
+
+    def set_epoch(self, epoch:int):
+        self._epoch = int(epoch)
+
 
     def reseed(self, base_seed: int, epoch: int, rank: int):
         self._rng = random.Random(int(base_seed + epoch * 997 + rank))
@@ -604,6 +623,116 @@ class XRRandomPatchDataset(Dataset):
         y0 = self._rng.randrange(0, max(1, self.H - h + 1))
         x0 = self._rng.randrange(0, max(1, self.W - w + 1))
         return t, y0, x0, h, w
+
+    def _nonuniform_sampler_precip(self, idx,
+                                   thr_mm_log1p: float = None,
+                                   accept_scale: float = 5.0,
+                                   max_tries: int = 20):
+        """
+        Prefer windows that contain precip (foreground-aware sampling).
+        - thr_mm_log1p: threshold in transform space; if None, we compute on raw mm.
+        - accept_scale: higher → more likely to accept precip-heavy windows.
+        """
+        # Local shorthands
+        H, W = self.H, self.W
+        h = min(self.patch, H)
+        w = min(self.patch, W)
+
+        # Choose a transform-aware threshold if you want to work in transform space.
+        # For simplicity we use raw mm here and threshold at 0.1 mm.
+        precip_thr_mm = 0.1
+
+        for _ in range(max_tries):
+            t = self._rng.randrange(self.T)
+            y0 = self._rng.randrange(0, max(1, H - h + 1))
+            x0 = self._rng.randrange(0, max(1, W - w + 1))
+
+            # Get fine plane from cache (your helper is already efficient)
+            y_fine = self._get_plane("y", t)  # [H_fine,W_fine] or coarse if coarsen_factor==1
+            patch = y_fine[y0:y0+h, x0:x0+w]
+
+            # Foreground fraction (precip present)
+            fg_frac = float((patch > precip_thr_mm).mean()) if patch.size else 0.0
+
+            # Accept with probability proportional to foreground fraction
+            # (cap to [0,1] via 1 - exp or min)
+            import math
+            p_accept = 1.0 - math.exp(-accept_scale * fg_frac)  # smooth monotonic
+            if self._rng.random() < p_accept:
+                return t, y0, x0, h, w
+
+        # Fallback to uniform if we didn't accept in max_tries
+        t = self._rng.randrange(self.T)
+        y0 = self._rng.randrange(0, max(1, H - h + 1))
+        x0 = self._rng.randrange(0, max(1, W - w + 1))
+        return t, y0, x0, h, w
+
+    #If using external Y (which we do) use this sampler to find places where they differ.
+    def _nonuniform_sampler_diff(self, idx,
+                                 err_percentile: float = 70.0,
+                                 accept_scale: float = 5.0,
+                                 max_tries: int = 20):
+        """
+        Prefer windows where |X - Y| is large (difference-aware sampling).
+        err_percentile controls a soft cutoff: patches above this percentile
+        of error are much more likely to be accepted.
+        """
+        H, W = self.H, self.W
+        h = min(self.patch, H)
+        w = min(self.patch, W)
+        has_x = (self.ds_x is not None)
+
+        # If no X is provided, fall back to precip-weighted
+        if not has_x:
+            return self._nonuniform_sampler_precip(idx)
+
+        # Precompute a robust error scale from a few random spots (optional cache)
+        # Here we just use a fixed percentile logic per trial for simplicity.
+        for _ in range(max_tries):
+            t = self._rng.randrange(self.T)
+            y0 = self._rng.randrange(0, max(1, H - h + 1))
+            x0 = self._rng.randrange(0, max(1, W - w + 1))
+
+            y_fine = self._get_plane("y", t)
+            x_fine = self._get_plane("x", t)
+            y_patch = y_fine[y0:y0+h, x0:x0+w]
+            x_patch = x_fine[y0:y0+h, x0:x0+w]
+
+            # Absolute error (clip inf/nan)
+            import numpy as np
+            err = np.abs(np.nan_to_num(y_patch, 0.0) - np.nan_to_num(x_patch, 0.0))
+            mean_err = float(err.mean())
+
+            # Map error to acceptance probability using a soft sigmoid
+            # You can also compute a dynamic threshold across a few random samples and compare to percentile.
+            import math
+            p_accept = 1.0 - math.exp(-accept_scale * mean_err)  # smooth, monotonic
+
+            if self._rng.random() < p_accept:
+                return t, y0, x0, h, w
+
+        # Fallback
+        t = self._rng.randrange(self.T)
+        y0 = self._rng.randrange(0, max(1, H - h + 1))
+        x0 = self._rng.randrange(0, max(1, W - w + 1))
+        return t, y0, x0, h, w
+
+    
+    def _hybrid_sampler(self, idx, epoch: int = 0, policy: str = "diff"):
+        """
+        Blend uniform and biased sampling with an epoch-dependent schedule.
+        - policy: "precip", "diff", or "hybrid"
+        """
+        # Example schedule: start 50% uniform, 50% biased; ramp to 10% / 90% by epoch 10.
+        u_frac = max(0.10, 0.50 - 0.04 * epoch)  # clamp at 10%
+        if self._rng.random() < u_frac:
+            return self._random_sampler(idx)
+
+        if policy == "diff" and (self.ds_x is not None):
+            return self._nonuniform_sampler_diff(idx)
+        else:
+            return self._nonuniform_sampler_precip(idx)
+
 
     def _make_tiles(self, tile, overlap):
         step = tile - overlap
@@ -844,48 +973,7 @@ class ClimateUNet(nn.Module):
         x = self.up3(x,  x2)
         x = self.up4(x,  x1)
         return self.outc(x)
-    
 
-class ClimateUNet5(nn.Module):
-    def __init__(self, in_ch, base_ch=64, norm='batch', act='silu', bilinear=True):
-        super().__init__()
-        # ----- Encoder (5 levels) -----
-        self.inc   = ConvBlock(in_ch, base_ch, norm=norm, act=act)               # x1
-        self.down1 = Down(base_ch,      base_ch*2, norm=norm, act=act)           # x2
-        self.down2 = Down(base_ch*2,    base_ch*4, norm=norm, act=act)           # x3
-        self.down3 = Down(base_ch*4,    base_ch*8, norm=norm, act=act)           # x4
-
-        factor = 2 if bilinear else 1
-        self.down4 = Down(base_ch*8,    base_ch*16 // factor, norm=norm, act=act) # x5
-        # NEW: one more level
-        self.down5 = Down(base_ch*16 // factor, base_ch*32 // factor, norm=norm, act=act)  # x6 (deepest)
-
-        # ----- Decoder (5 ups) -----
-        # concat doubles channels at each skip
-        self.up1 = Up(base_ch*32, base_ch*16 // factor, bilinear=bilinear, norm=norm, act=act)  # x6 + x5
-        self.up2 = Up(base_ch*16, base_ch*8  // factor, bilinear=bilinear, norm=norm, act=act)  # + x4
-        self.up3 = Up(base_ch*8,  base_ch*4  // factor, bilinear=bilinear, norm=norm, act=act)  # + x3
-        self.up4 = Up(base_ch*4,  base_ch*2  // factor, bilinear=bilinear, norm=norm, act=act)  # + x2
-        self.up5 = Up(base_ch*2,  base_ch,               bilinear=bilinear, norm=norm, act=act)  # + x1
-
-        self.outc = OutConv(base_ch, 1)
-
-    def forward(self, x):
-        # Encoder
-        x1 = self.inc(x)          # H,   W
-        x2 = self.down1(x1)       # H/2, W/2
-        x3 = self.down2(x2)       # H/4, W/4
-        x4 = self.down3(x3)       # H/8, W/8
-        x5 = self.down4(x4)       # H/16,W/16
-        x6 = self.down5(x5)       # H/32,W/32   (deeper)
-
-        # Decoder
-        x  = self.up1(x6, x5)     # -> H/16
-        x  = self.up2(x,  x4)     # -> H/8
-        x  = self.up3(x,  x3)     # -> H/4
-        x  = self.up4(x,  x2)     # -> H/2
-        x  = self.up5(x,  x1)     # -> H
-        return self.outc(x)
 # ---------------------------
 # Losses & metrics
 # ---------------------------
@@ -1257,6 +1345,10 @@ def train(cfg: Config):
 
         if hasattr(ds_tr, "reseed"):
             ds_tr.reseed(cfg.seed, epoch, global_rank)
+        #Call set_epoch(epoch) immediately after reseeding (reseed) and before the first batch is pulled.
+        #That ensures every worker process uses the epoch number for your sampler logic for the entire epoch.
+        if hasattr(ds_tr, "set_epoch"):
+            ds_tr.set_epoch(epoch)
 
         time.sleep(0.25 * (global_rank if ddp_is_initialized() else 0))
         if is_main:
@@ -1354,11 +1446,51 @@ def train(cfg: Config):
                     X = torch.cat([x_tr, X[:, 1:]], dim=1)
 
             with autocast_cm():
+                #delta - How much should the raw input precip be adjusted at each pixel, in transformed space,
+                #to correct biases, structure, intensity, etc
+#                🔷 2. Why predict δ instead of predicting Y directly?
+                        #This is the most important design choice in your entire system.
+                        #✔️ Stabilizes learning
+                        #Predicting absolute precipitation from scratch is hard — magnitudes vary from 0 to hundreds of mm.
+                        #Predicting a correction on top of an existing field is much easier and keeps loss scales stable.
+                        #✔️ Physically meaningful
+                        #Your input X is a noisy or degraded precipitation estimate (coarsened radar or degraded PRISM).
+                        #Correcting X is physically grounded:#
+                        #
+                        #preserves global structure
+                        #preserves “mass” more naturally
+                        #avoids unphysical artifacts
+                        #
+                        #✔️ Much easier for the network
+                        #The model doesn't need to learn precipitation from zero.
+                        #It only learns “how to fix what's wrong.”
                 delta = model(X)
+
+                
                 Y_pred_tr = apply_residual_gate_in_tr_space(
                     X_tr=X[:, 0:1], delta_tr=delta, M=M,
                     c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                 )
+
+                #This gate:
+                        #✔ prevents huge δ corrections
+                        #Because model can make large errors early → gate keeps corrections sane.
+                       # ✔ allows bigger corrections where X is small
+                        #Small base precipitation often needs bigger % corrections.
+                       # ✔ enforces some structure outside domain
+                        #The gate looks like (conceptually):
+                        #residual_weight = sigmoid(β * (c - X_tr))
+
+                        #Y_pred_tr = X_tr + residual_weight * δ
+
+                        #Meaning:
+
+                        #Where X_tr is high → residual_weight small (don't destroy high-intensity structure)
+                        #Where X_tr is low → allow larger corrections
+                        #Outside domain → α_bg can cap or relax corrections
+                        #Everywhere else → correction behavior is smooth and stable
+
+                        #This rescues training from large δ explosions seen in early epochs.
 
             # Fence fragile components in FP32 once; reuse below
             with torch.autocast(device_type="cuda", enabled=False):
@@ -1847,40 +1979,31 @@ def main():
     if args.out_path:      cfg.out_path  = args.out_path
     if args.ckpt:          cfg.ckpt      = args.ckpt
 
-    if args.timeslice_cache is not None:
-        cfg.timeslice_cache = args.timeslice_cache
+    if args.biased_crops: cfg.biased_crops  = args.biased_crops
+    if args.biased_policy:  cfg.biased_policy = args.biased_policy
+    if args.biased_warmup_epochs: cfg.biased_warmup_epochs = args.biased_warmup_epochs
 
-    if args.batch_size is not None:
-        cfg.batch_size = args.batch_size
-
-    if args.patch is not None:
-        cfg.patch = args.patch    
+    if args.timeslice_cache is not None: cfg.timeslice_cache = args.timeslice_cache
+    if args.batch_size is not None: cfg.batch_size = args.batch_size
+    if args.patch is not None: cfg.patch = args.patch    
 
     # world size before ddp_setup() may be unavailable; use env if present
     world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
     bs = cfg.batch_size
 
-    if args.steps_per_epoch is not None:
-        cfg.train_crops_per_epoch = args.steps_per_epoch * bs * world_size_env
-    if args.val_steps is not None:
-        cfg.val_crops_per_epoch   = args.val_steps * bs  # val runs only on rank 0
+    if args.steps_per_epoch is not None: cfg.train_crops_per_epoch = args.steps_per_epoch * bs * world_size_env
+    if args.val_steps is not None: cfg.val_crops_per_epoch   = args.val_steps * bs  # val runs only on rank 0
 
     if args.climatology_npy: cfg.climatology_npy = args.climatology_npy
     if args.domain_mask_npy: cfg.domain_mask_npy = args.domain_mask_npy
 
-    if args.num_workers is not None:
-        cfg.num_workers = args.num_workers
-    if args.val_num_workers is not None:
-        cfg.val_num_workers = args.val_num_workers
-    if args.prefetch_factor is not None:
-        cfg.prefetch_factor = args.prefetch_factor
-    if args.persistent_workers:
-        cfg.persistent_workers = True
+    if args.num_workers is not None: cfg.num_workers = args.num_workers
+    if args.val_num_workers is not None: cfg.val_num_workers = args.val_num_workers
+    if args.prefetch_factor is not None: cfg.prefetch_factor = args.prefetch_factor
+    if args.persistent_workers: cfg.persistent_workers = True
 
-    if args.out_dir:
-        cfg.out_dir = args.out_dir
-    if args.ckpt_name:
-        cfg.ckpt_name = args.ckpt_name
+    if args.out_dir: cfg.out_dir = args.out_dir
+    if args.ckpt_name: cfg.ckpt_name = args.ckpt_name
 
     if args.mode == "train":
         assert cfg.prism_train_paths and cfg.prism_val_paths, "Provide --train_paths and --val_paths"
