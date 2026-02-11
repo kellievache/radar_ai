@@ -29,9 +29,17 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 #  --domain_mask_npy /scratch/$USER/prism_domain_mask.npy \
 #  --climatology_npy /scratch/$USER/prism_daily_normals_366.npy
 
+#python unet_radar_correction6.py \
+#  --mode train \
+#  ... \
+#  --num_levels 5 \
+#  --deep_supervision \
+#  --ds_weights 0.2 0.1
+
 
 python unet_radar_correction.py \
   --mode train \
+  --num_levels 4 \
   --out_dir /nfs/pancake/u5/projects/vachek/radar_ai/models/ \
   --resume_from /nfs/pancake/u5/projects/vachek/radar_ai/models/best.pt \
   --best_name best_update.pt \

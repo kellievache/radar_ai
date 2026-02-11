@@ -315,9 +315,18 @@ class Config:
     biased_policy: str = "precip"
     biased_warmup_epochs: int = 2
 
+    
+    num_levels: int = 4                 # 4 (current) or 5 (deeper receptive field)
+    deep_supervision: bool = False      # turn on aux heads & losses
+    ds_weights: List[float] = None      # weights for aux heads, e.g., [0.2, 0.
+
+
     def __post_init__(self):
         if self.fss_thresholds is None:
             self.fss_thresholds = [1.0, 5.0, 10.0, 20.0]
+
+        if self.ds_weights is None:
+            self.ds_weights = [0.2, 0.1]  # sensible default (two aux 
 
 # ---------------------------
 # Degradation ops
@@ -976,32 +985,89 @@ class ClimateUNet(nn.Module):
         return self.outc(x)
 
 
-class ClimateUNet5(nn.Module):
-    def __init__(self, in_ch, base_ch=64, norm='batch', act='silu', bilinear=True, deep_supervision=True):
+class ClimateUNetFlex(nn.Module):
+    def __init__(self, in_ch, base_ch=64, norm='batch', act='silu',
+                 bilinear=True, num_levels: int = 4, deep_supervision: bool = False):
         super().__init__()
-        self.deep_supervision = deep_supervision
-        self.inc   = ConvBlock(in_ch, base_ch, norm=norm, act=act)
-        self.down1 = Down(base_ch,      base_ch*2, norm=norm, act=act)
-        self.down2 = Down(base_ch*2,    base_ch*4, norm=norm, act=act)
-        self.down3 = Down(base_ch*4,    base_ch*8, norm=norm, act=act)
+        assert num_levels in (4, 5), "num_levels must be 4 or 5"
+        self.num_levels = num_levels
+        self.deep_supervision = bool(deep_supervision)
+
+        # ----- Encoder -----
+        self.inc   = ConvBlock(in_ch, base_ch, norm=norm, act=act)                 # x1
+        self.down1 = Down(base_ch,      base_ch*2, norm=norm, act=act)             # x2
+        self.down2 = Down(base_ch*2,    base_ch*4, norm=norm, act=act)             # x3
+        self.down3 = Down(base_ch*4,    base_ch*8, norm=norm, act=act)             # x4
+
         factor = 2 if bilinear else 1
-        self.down4 = Down(base_ch*8,    base_ch*16 // factor, norm=norm, act=act)
+        self.down4 = Down(base_ch*8,    base_ch*16 // factor, norm=norm, act=act)  # x5
 
-        self.up1 = Up(base_ch*16, base_ch*8  // factor, bilinear=bilinear, norm=norm, act=act)  # -> H/8
-        self.up2 = Up(base_ch*8,  base_ch*4  // factor, bilinear=bilinear, norm=norm, act=act)  # -> H/4
-        self.up3 = Up(base_ch*4,  base_ch*2  // factor, bilinear=bilinear, norm=norm, act=act)  # -> H/2
-        self.up4 = Up(base_ch*2,  base_ch,               bilinear=bilinear, norm=norm, act=act)  # -> H
+        if num_levels == 5:
+            self.down5 = Down(base_ch*16 // factor, base_ch*32 // factor, norm=norm, act=act)  # x6
 
-        # main head (residual delta in transform space)
+        # ----- Decoder -----
+        if num_levels == 5:
+            self.up1 = Up(base_ch*32, base_ch*16 // factor, bilinear=bilinear, norm=norm, act=act)  # x6 + x5
+            self.up2 = Up(base_ch*16, base_ch*8  // factor, bilinear=bilinear, norm=norm, act=act)  # + x4
+            self.up3 = Up(base_ch*8,  base_ch*4  // factor, bilinear=bilinear, norm=norm, act=act)  # + x3
+            self.up4 = Up(base_ch*4,  base_ch*2  // factor, bilinear=bilinear, norm=norm, act=act)  # + x2
+            self.up5 = Up(base_ch*2,  base_ch,               bilinear=bilinear, norm=norm, act=act)  # + x1
+        else:
+            self.up1 = Up(base_ch*16, base_ch*8  // factor, bilinear=bilinear, norm=norm, act=act)  # x5 + x4
+            self.up2 = Up(base_ch*8,  base_ch*4  // factor, bilinear=bilinear, norm=norm, act=act)  # + x3
+            self.up3 = Up(base_ch*4,  base_ch*2  // factor, bilinear=bilinear, norm=norm, act=act)  # + x2
+            self.up4 = Up(base_ch*2,  base_ch,               bilinear=bilinear, norm=norm, act=act)  # + x1
+
         self.outc = OutConv(base_ch, 1)
 
-        # ---------------------------
-        # Deep supervision heads
-        # ---------------------------
+        # ----- Deep supervision heads (two aux heads at the deepest decoder scales) -----
         if self.deep_supervision:
-            # up1 output channels = base_ch*8//factor, up2 output = base_ch*4//factor
-            self.aux1 = OutConv(base_ch*8  // factor, 1)  # deepest decoder feature (H/8)
-            self.aux2 = OutConv(base_ch*4  // factor, 1)  # mid decoder feature    (H/4)
+            if num_levels == 5:
+                self.aux1 = OutConv(base_ch*16 // factor, 1)  # after up1 (H/16)
+                self.aux2 = OutConv(base_ch*8  // factor, 1)  # after up2 (H/8)
+            else:
+                self.aux1 = OutConv(base_ch*8  // factor, 1)  # after up1 (H/8)
+                self.aux2 = OutConv(base_ch*4  // factor, 1)  # after up2 (H/4)
+
+    def forward(self, x):
+        # ---- Encoder ----
+        x1 = self.inc(x)     # H
+        x2 = self.down1(x1)  # H/2
+        x3 = self.down2(x2)  # H/4
+        x4 = self.down3(x3)  # H/8
+        x5 = self.down4(x4)  # H/16
+
+        if self.num_levels == 5:
+            x6 = self.down5(x5)  # H/32
+
+            # ---- Decoder (collect features for aux heads) ----
+            y  = self.up1(x6, x5)     # H/16
+            feat1 = y
+            y  = self.up2(y,  x4)     # H/8
+            feat2 = y
+            y  = self.up3(y,  x3)     # H/4
+            y  = self.up4(y,  x2)     # H/2
+            y  = self.up5(y,  x1)     # H
+        else:
+            y  = self.up1(x5, x4)     # H/8
+            feat1 = y
+            y  = self.up2(y,  x3)     # H/4
+            feat2 = y
+            y  = self.up3(y,  x2)     # H/2
+            y  = self.up4(y,  x1)     # H
+
+        main_delta = self.outc(y)     # [B,1,H,W]
+
+        # In eval or if deep supervision disabled → return main only
+        if (not self.training) or (not self.deep_supervision):
+            return main_delta
+
+        # Training + deep supervision → return main + aux dict
+        aux = {
+            "aux1": self.aux1(feat1),   # deepest decoder scale
+            "aux2": self.aux2(feat2),   # next decoder scale
+        }
+        return main_delta, aux
 
     def forward(self, x):
         # Encoder
@@ -1312,7 +1378,16 @@ def train(cfg: Config):
     # Total input channels: precip*, (+DEM?), mask, climatology
     in_ch = n_precip_in + (1 if has_dem else 0) + 1 + 1
 
-    model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
+  # model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
+  #  model = model.to(memory_format=torch.channels_last)
+
+    
+    model = ClimateUNetFlex(
+        in_ch=in_ch,
+        base_ch=cfg.base_ch,
+        num_levels=cfg.num_levels,
+        deep_supervision=cfg.deep_supervision
+    ).to(device)
     model = model.to(memory_format=torch.channels_last)
 
     # --- Optimizer & Scheduler (create BEFORE loading states) ---
@@ -1440,13 +1515,25 @@ def train(cfg: Config):
 
         opt.zero_grad(set_to_none=True)
 
+      #  with autocast_cm():
+      #      delta0 = model(X0)
+      #      Y0_pred_tr = apply_residual_gate_in_tr_space(
+      #          X_tr=X0[:, 0:1], delta_tr=delta0, M=M0,
+      #          c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+      #      )
+
         with autocast_cm():
-            delta0 = model(X0)
+            out0 = model(X0)
+            if isinstance(out0, tuple):
+                delta0, aux0 = out0
+            else:
+                delta0, aux0 = out0, None
+
             Y0_pred_tr = apply_residual_gate_in_tr_space(
                 X_tr=X0[:, 0:1], delta_tr=delta0, M=M0,
-                c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
-            )
-
+                c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg)
+        
+            
             if cfg.loss == "huber":
                 data_loss0 = F.smooth_l1_loss(Y0_pred_tr * M0, Y0 * M0)
             else:
@@ -1469,6 +1556,36 @@ def train(cfg: Config):
             loss0 = data_loss0 + gl0 + spec0 + mass0 + hp0 + fssl0
             lambda_res = 0.01
             loss0 = loss0 + lambda_res * (delta0 ** 2).mean()
+
+
+
+        # --- Deep supervision (optional) ---
+        if cfg.deep_supervision and aux0 is not None:
+            ds_w = (cfg.ds_weights or [0.2, 0.1])
+            aux_losses0 = []
+            # aux1, aux2 at lower resolutions: compute coarse data loss only (simple & stable)
+            for i, key in enumerate(("aux1", "aux2")):
+                if key not in aux0 or i >= len(ds_w) or ds_w[i] <= 0:
+                    continue
+                aux_delta = aux0[key]
+                h, w = aux_delta.shape[-2:]
+                X0_ds = F.interpolate(X0[:, 0:1], size=(h, w), mode="area")
+                Y0_ds = F.interpolate(Y0,         size=(h, w), mode="area")
+                M0_ds = F.interpolate(M0,         size=(h, w), mode="nearest")
+                with autocast_cm():
+                    Y0_pred_aux = apply_residual_gate_in_tr_space(
+                        X_tr=X0_ds, delta_tr=aux_delta, M=M0_ds,
+                        c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                    )
+                    if cfg.loss == "huber":
+                        aux_data = F.smooth_l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds)
+                    else:
+                        aux_data = F.l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds)
+                aux_losses0.append(ds_w[i] * aux_data)
+            if aux_losses0:
+                loss0 = loss0 + sum(aux_losses0)
+
+
 
         loss0.backward()
         opt.step()
@@ -1499,11 +1616,23 @@ def train(cfg: Config):
                     X = torch.cat([x_tr, X[:, 1:]], dim=1)
 
             with autocast_cm():
-                delta = model(X)
+                out = model(X)
+                if isinstance(out, tuple):
+                    delta, aux = out
+                else:
+                    delta, aux = out, None
+
                 Y_pred_tr = apply_residual_gate_in_tr_space(
                     X_tr=X[:, 0:1], delta_tr=delta, M=M,
                     c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                 )
+
+ #           with autocast_cm():
+ #               delta = model(X)
+ #               Y_pred_tr = apply_residual_gate_in_tr_space(
+ #                   X_tr=X[:, 0:1], delta_tr=delta, M=M,
+ #                   c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+ #               )
 
             # Fence fragile components in FP32 once; reuse below
             with torch.autocast(device_type="cuda", enabled=False):
@@ -1531,6 +1660,35 @@ def train(cfg: Config):
 
             lambda_res = 0.01
             loss = loss + lambda_res * (delta ** 2).mean()
+
+
+            # --- Deep supervision (optional) ---
+            if cfg.deep_supervision and aux is not None:
+                ds_w = (cfg.ds_weights or [0.2, 0.1])
+                aux_losses = []
+                for i, key in enumerate(("aux1", "aux2")):
+                    if key not in aux or i >= len(ds_w) or ds_w[i] <= 0:
+                        continue
+                    aux_delta = aux[key]
+                    h, w = aux_delta.shape[-2:]
+                    X_ds = F.interpolate(X[:, 0:1], size=(h, w), mode="area")
+                    Y_ds = F.interpolate(Y_true,    size=(h, w), mode="area")
+                    M_ds = F.interpolate(M,         size=(h, w), mode="nearest")
+                    with autocast_cm():
+                        Y_pred_aux = apply_residual_gate_in_tr_space(
+                            X_tr=X_ds, delta_tr=aux_delta, M=M_ds,
+                            c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                        )
+                        if cfg.loss == "huber":
+                            aux_data = F.smooth_l1_loss(Y_pred_aux * M_ds, Y_ds * M_ds)
+                        else:
+                            aux_data = F.l1_loss(Y_pred_aux * M_ds, Y_ds * M_ds)
+                    aux_losses.append(ds_w[i] * aux_data)
+                if aux_losses:
+                    loss = loss + sum(aux_losses)
+
+
+
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # gradient clipping seatbelt
@@ -1982,6 +2140,15 @@ def build_arg_parser():
     ap.add_argument("--biased_crops", type=int, default=None, help="N ")
     ap.add_argument("--biased_policy", type=int, default=None, help="Va")
     ap.add_argument("--biased_warmup_epochs", type=int, default=None, help="")
+
+    #Deeper UNET with 5 levels
+    ap.add_argument("--num_levels", type=int, choices=[4, 5], default=4,
+                    help="UNet depth: 4 (current) or 5 (deeper receptive field).")
+    ap.add_argument("--deep_supervision", action="store_true",
+                    help="Enable deep supervision heads and coarse losses.")
+    ap.add_argument("--ds_weights", type=float, nargs="*", default=None,
+                    help="Aux head weights, e.g., --ds_weights 0.2 0.1 (match 2 heads).")
+
     return ap
 
 def main():
