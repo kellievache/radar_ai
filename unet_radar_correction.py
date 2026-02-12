@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import time
+import torch.multiprocessing as mp
 # --- add at top of file if not already there
 import torch.nn.functional as F
 try:
@@ -904,6 +905,21 @@ class XRRandomPatchDataset(Dataset):
 
         if not (torch.is_tensor(X) and torch.is_tensor(Y) and torch.is_tensor(M)):
             raise RuntimeError("Dataset produced non-tensor outputs")
+        
+
+        # assuming you already built X, Y, M as torch tensors: [C,H,W], [1,H,W], [1,H,W]
+        if self.mode == "val":
+            P = int(self.patch)  # 896 or 1024
+            H, W = X.shape[-2:]
+            if H != P or W != P:
+                # pad order: (left, right, top, bottom) for 2D → (W-left, W-right, H-top, H-bottom)
+                dh = max(0, P - H)
+                dw = max(0, P - W)
+                pad2d = (0, dw, 0, dh)
+                X = F.pad(X, pad2d, mode="constant", value=0.0)
+                Y = F.pad(Y, pad2d, mode="constant", value=0.0)
+                # zero mask on padded region so it doesn't contribute to the loss/metrics
+                M = F.pad(M, pad2d, mode="constant", value=0.0)
         return X, Y, M
 
 # ---------------------------
@@ -1258,8 +1274,34 @@ def write_bil_pair(arr2d: np.ndarray, bil_path: str, hdr_path: str,
 # ---------------------------
 # Training
 # ---------------------------
+
+
+#def safe_collate(batch):
+#    """Fail-fast collate to catch None or malformed dataset items during debugging."""
+#    for i, item in enumerate(batch):
+#        if item is None:
+#            raise RuntimeError(f"[safe_collate] Dataset returned None at batch position {i}")
+#        if not (isinstance(item, (list, tuple)) and len(item) == 3):
+#            raise RuntimeError(f"[safe_collate] Bad item structure at pos {i}: type={type(item)}, item={item}")
+#        X, Y, M = item
+#        if not (torch.is_tensor(X) and torch.is_tensor(Y) and torch.is_tensor(M)):
+#            raise RuntimeError(f"[safe_collate] Non-tensor at pos {i}: types=({type(X)}, {type(Y)}, {type(M)})")
+#    return default_collate(batch)
+
+
+
+from torch.utils.data._utils.collate import default_collate
+
 def safe_collate(batch):
-    """Fail-fast collate to catch None or malformed dataset items during debugging."""
+    """
+    Defensive collate that:
+      1) fail-fast checks for bad dataset items (None / bad structure / non-tensors)
+      2) ensures each tensor owns a resizable, contiguous storage (avoids 'resize storage not resizable')
+      3) then delegates to default_collate
+    """
+    import torch
+
+    # ---- 1) diagnostics (your current checks) ----
     for i, item in enumerate(batch):
         if item is None:
             raise RuntimeError(f"[safe_collate] Dataset returned None at batch position {i}")
@@ -1268,12 +1310,33 @@ def safe_collate(batch):
         X, Y, M = item
         if not (torch.is_tensor(X) and torch.is_tensor(Y) and torch.is_tensor(M)):
             raise RuntimeError(f"[safe_collate] Non-tensor at pos {i}: types=({type(X)}, {type(Y)}, {type(M)})")
-    return default_collate(batch)
+
+    # ---- 2) storage fix: make tensors owned + contiguous ----
+    def own_and_contig(t: torch.Tensor) -> torch.Tensor:
+        # If t is a view (non-owning) or non-contiguous, make an owned contiguous clone
+        if t._base is not None or not t.is_contiguous():
+            return t.contiguous().clone()
+        return t
+
+    fixed = []
+    for (X, Y, M) in batch:
+        X = own_and_contig(X)
+        Y = own_and_contig(Y)
+        M = own_and_contig(M)
+        fixed.append((X, Y, M))
+
+    # ---- 3) standard stacking ----
+    return default_collate(fixed)
 
 def train(cfg: Config):
     import torch.multiprocessing as mp
+    import time
+    import numpy as np
+    from contextlib import nullcontext
     import dask
+
     mp.set_start_method("spawn", force=True)
+    mp.set_sharing_strategy("file_system")  # fewer semaphore issues with many workers
 
     # single-threaded dask within each worker/process
     try:
@@ -1311,9 +1374,9 @@ def train(cfg: Config):
 
     if is_main:
         print(f"[train] out_dir            : {os.path.abspath(cfg.out_dir)}")
-        print(f"[train] resume_from       : {cfg.resume_from or 'None'}")
-        print(f"[train] will save best to : {os.path.join(cfg.out_dir, cfg.best_name)}")
-        print(f"[train] will save last to : {os.path.join(cfg.out_dir, cfg.last_name)}")
+        print(f"[train] resume_from       : {resume_from or 'None'}")
+        print(f"[train] will save best to : {ckpt_best}")
+        print(f"[train] will save last to : {ckpt_last}")
 
     best_val = float('inf')
     best_epoch = -1
@@ -1335,6 +1398,15 @@ def train(cfg: Config):
     # --- Datasets ---
     ds_tr = XRRandomPatchDataset(y_paths=cfg.prism_train_paths,
                                  x_paths=cfg.x_train_paths, cfg=cfg, mode="train")
+    
+    
+    if getattr(cfg, "steps_per_epoch", 0):
+        world = world_size if ddp_is_initialized() else 1
+        ds_tr.N = int(cfg.steps_per_epoch) * int(cfg.batch_size) * int(world)
+        if is_main:
+            print(f"[train] overriding ds_tr.N to {ds_tr.N} for steps_per_epoch={cfg.steps_per_epoch}, "
+                f"bs={cfg.batch_size}, world={world}", flush=True)
+
 
     dl_tr = DataLoader(
         ds_tr,
@@ -1345,7 +1417,7 @@ def train(cfg: Config):
         pin_memory=True,
         drop_last=True,
         persistent_workers=cfg.persistent_workers,
-        prefetch_factor=cfg.prefetch_factor,
+       # prefetch_factor=cfg.prefetch_factor,
         collate_fn=safe_collate
     )
 
@@ -1353,15 +1425,25 @@ def train(cfg: Config):
     if is_main:
         ds_va = XRRandomPatchDataset(y_paths=cfg.prism_val_paths,
                                      x_paths=cfg.x_val_paths, cfg=cfg, mode="val")
+       # dl_va = DataLoader(
+       #     ds_va,
+       #     batch_size=cfg.batch_size,
+       #     shuffle=False,
+       #     #num_workers=cfg.val_num_workers,
+       #     num_workers=0,  # set to 0 for validation to avoid potential deadlocks and speed up small eval sets
+       #     pin_memory=True,
+       #     #persistent_workers=cfg.persistent_workers,
+       #     persistent_workers=False,
+       #    # prefetch_factor=cfg.prefetch_factor,
+       #     collate_fn=safe_collate
+       # )
+
+        val_num_workers = 0
         dl_va = DataLoader(
-            ds_va,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=cfg.val_num_workers,
-            pin_memory=True,
-            persistent_workers=cfg.persistent_workers,
-            prefetch_factor=cfg.prefetch_factor,
-            collate_fn=safe_collate
+            ds_va, batch_size=cfg.batch_size, shuffle=False,
+            num_workers=val_num_workers, pin_memory=True,
+            persistent_workers=False, collate_fn=safe_collate,
+            timeout=0   # required for num_workers=0
         )
 
     # --- Model ---
@@ -1378,10 +1460,6 @@ def train(cfg: Config):
     # Total input channels: precip*, (+DEM?), mask, climatology
     in_ch = n_precip_in + (1 if has_dem else 0) + 1 + 1
 
-  # model = ClimateUNet(in_ch=in_ch, base_ch=cfg.base_ch).to(device)
-  #  model = model.to(memory_format=torch.channels_last)
-
-    
     model = ClimateUNetFlex(
         in_ch=in_ch,
         base_ch=cfg.base_ch,
@@ -1401,6 +1479,9 @@ def train(cfg: Config):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=30, threshold=1e-5
     )
+
+    # ---- Gradient accumulation (reduce all-reduces under DDP) ----
+    accum_steps = 2   # or 4; tune based on VRAM/throughput
 
     # --- Load checkpoint if exists (weights, opt, scheduler) ---
     start_epoch = 1
@@ -1428,7 +1509,8 @@ def train(cfg: Config):
 
     # 1) Try explicit --resume_from (full path)
     if resume_from and os.path.exists(resume_from):
-        ckpt = torch.load(resume_from, map_location=device)
+        with open(resume_from, "rb") as f:
+            ckpt = torch.load(f, map_location=device)
         if isinstance(ckpt, dict) and ("optimizer" in ckpt or "epoch" in ckpt or "model" in ckpt):
             _load_full_training_state(ckpt)
         else:
@@ -1439,7 +1521,8 @@ def train(cfg: Config):
 
     # 2) Else try <out_dir>/<last_name>
     elif os.path.exists(ckpt_last):
-        ckpt = torch.load(ckpt_last, map_location=device)
+        with open(ckpt_last, "rb") as f:
+            ckpt = torch.load(f, map_location=device)
         _load_full_training_state(ckpt)
         ckpt_loaded = True
         if is_main:
@@ -1513,87 +1596,86 @@ def train(cfg: Config):
                 x_tr = mm_to_transform(x_mm, cfg.transform)
                 X0 = torch.cat([x_tr, X0[:, 1:]], dim=1)
 
+        # Clear grads at the start of the accumulation window
         opt.zero_grad(set_to_none=True)
 
-      #  with autocast_cm():
-      #      delta0 = model(X0)
-      #      Y0_pred_tr = apply_residual_gate_in_tr_space(
-      #          X_tr=X0[:, 0:1], delta_tr=delta0, M=M0,
-      #          c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
-      #      )
+        # Determine if this micro-step should all-reduce (sync) or not
+        step0 = 0
+        is_sync_step0 = (((step0 + 1) % accum_steps) == 0)
+        ctx0 = nullcontext() if is_sync_step0 or (not ddp_is_initialized()) else model.no_sync()
 
-        with autocast_cm():
-            out0 = model(X0)
-            if isinstance(out0, tuple):
-                delta0, aux0 = out0
-            else:
-                delta0, aux0 = out0, None
+        with ctx0:
+            with autocast_cm():
+                out0 = model(X0)
+                if isinstance(out0, tuple):   # supports deep supervision
+                    delta0, aux0 = out0
+                else:
+                    delta0, aux0 = out0, None
 
-            Y0_pred_tr = apply_residual_gate_in_tr_space(
-                X_tr=X0[:, 0:1], delta_tr=delta0, M=M0,
-                c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg)
-        
-            
+                Y0_pred_tr = apply_residual_gate_in_tr_space(
+                    X_tr=X0[:, 0:1], delta_tr=delta0, M=M0,
+                    c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                )
+
+            # FP32 fence section (mirrors main loop)
+            with torch.autocast(device_type="cuda", enabled=False):
+                Y0_pred_tr_clamped = Y0_pred_tr.clamp(0.0, 12.0).float()
+                Y0mm  = transform_to_mm(Y0_pred_tr_clamped, cfg.transform).float()
+                T0mm  = transform_to_mm(Y0,               cfg.transform).float()
+                Y0mm  = torch.nan_to_num(Y0mm, nan=0.0, posinf=0.0, neginf=0.0)
+                T0mm  = torch.nan_to_num(T0mm, nan=0.0, posinf=0.0, neginf=0.0)
+                spec0 = spectral_loss(Y0_pred_tr * M0, Y0 * M0).float() * cfg.w_spec if cfg.w_spec > 0 \
+                        else torch.tensor(0., device=device)
+
             if cfg.loss == "huber":
                 data_loss0 = F.smooth_l1_loss(Y0_pred_tr * M0, Y0 * M0)
             else:
                 data_loss0 = F.l1_loss(Y0_pred_tr * M0, Y0 * M0)
-
-            gl0 = gradient_loss(Y0_pred_tr, Y0, mask=M0) * cfg.w_grad
-
-            # Clamp before inverse transform & FP32 fragile ops
-            with torch.autocast(device_type="cuda", enabled=False):
-                Y0_pred_tr_clamped = Y0_pred_tr.clamp(min=0.0, max=12.0).float()
-                Y0mm  = transform_to_mm(Y0_pred_tr_clamped, cfg.transform).float()
-                T0mm  = transform_to_mm(Y0, cfg.transform).float()
-                Y0mm  = torch.nan_to_num(Y0mm, nan=0.0, posinf=0.0, neginf=0.0)
-                T0mm  = torch.nan_to_num(T0mm, nan=0.0, posinf=0.0, neginf=0.0)
-                spec0 = spectral_loss(Y0_pred_tr * M0, Y0 * M0).float() * cfg.w_spec if cfg.w_spec > 0 else torch.tensor(0., device=device)
-
+            gl0   = gradient_loss(Y0_pred_tr, Y0, mask=M0) * cfg.w_grad
             mass0 = mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass if cfg.w_mass > 0 else 0.0
             hp0   = F.l1_loss(highpass(Y0_pred_tr, 1.5) * M0, highpass(Y0, 1.5) * M0) * cfg.w_hp if cfg.w_hp > 0 else 0.0
             fssl0 = fss_loss(Y0mm, T0mm, cfg.fss_thresholds, cfg.fss_window, M0) * cfg.w_fss if cfg.w_fss > 0 else 0.0
             loss0 = data_loss0 + gl0 + spec0 + mass0 + hp0 + fssl0
-            lambda_res = 0.01
-            loss0 = loss0 + lambda_res * (delta0 ** 2).mean()
+            loss0 = loss0 + 0.01 * (delta0 ** 2).mean()
 
+            # (Optional) deep supervision aux losses for step-0
+            if cfg.deep_supervision and aux0 is not None:
+                ds_w = (cfg.ds_weights or [0.2, 0.1])
+                aux_losses0 = []
+                for i, key in enumerate(("aux1", "aux2")):
+                    if key not in aux0 or i >= len(ds_w) or ds_w[i] <= 0:
+                        continue
+                    aux_delta = aux0[key]
+                    h, w = aux_delta.shape[-2:]
+                    X0_ds = F.interpolate(X0[:, 0:1], size=(h, w), mode="area")
+                    Y0_ds = F.interpolate(Y0,         size=(h, w), mode="area")
+                    M0_ds = F.interpolate(M0,         size=(h, w), mode="nearest")
+                    with autocast_cm():
+                        Y0_pred_aux = apply_residual_gate_in_tr_space(
+                            X_tr=X0_ds, delta_tr=aux_delta, M=M0_ds,
+                            c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                        )
+                        aux_data = F.smooth_l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds) if cfg.loss == "huber" \
+                                  else F.l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds)
+                    aux_losses0.append(ds_w[i] * aux_data)
+                if aux_losses0:
+                    loss0 = loss0 + sum(aux_losses0)
 
+        # Scale the loss for accumulation BEFORE backward
+        (loss0 / accum_steps).backward()
 
-        # --- Deep supervision (optional) ---
-        if cfg.deep_supervision and aux0 is not None:
-            ds_w = (cfg.ds_weights or [0.2, 0.1])
-            aux_losses0 = []
-            # aux1, aux2 at lower resolutions: compute coarse data loss only (simple & stable)
-            for i, key in enumerate(("aux1", "aux2")):
-                if key not in aux0 or i >= len(ds_w) or ds_w[i] <= 0:
-                    continue
-                aux_delta = aux0[key]
-                h, w = aux_delta.shape[-2:]
-                X0_ds = F.interpolate(X0[:, 0:1], size=(h, w), mode="area")
-                Y0_ds = F.interpolate(Y0,         size=(h, w), mode="area")
-                M0_ds = F.interpolate(M0,         size=(h, w), mode="nearest")
-                with autocast_cm():
-                    Y0_pred_aux = apply_residual_gate_in_tr_space(
-                        X_tr=X0_ds, delta_tr=aux_delta, M=M0_ds,
-                        c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
-                    )
-                    if cfg.loss == "huber":
-                        aux_data = F.smooth_l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds)
-                    else:
-                        aux_data = F.l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds)
-                aux_losses0.append(ds_w[i] * aux_data)
-            if aux_losses0:
-                loss0 = loss0 + sum(aux_losses0)
+        # Only step/zero when we reach the sync boundary
+        if is_sync_step0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
 
-
-
-        loss0.backward()
-        opt.step()
         running += float(loss0.detach())
 
         steps_iter = tqdm(range(1, expected_steps), total=expected_steps, initial=1,
                           desc=f"Epoch {epoch}/{cfg.epochs} [train]") if is_main else range(1, expected_steps)
 
+        # DO NOT zero_grad here unconditionally; only at sync boundaries (see below)
         for step in steps_iter:
             try:
                 X, Y_true, M = next(it_tr)
@@ -1605,8 +1687,7 @@ def train(cfg: Config):
             Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
             M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
 
-            opt.zero_grad(set_to_none=True)
-
+            # If you generate degraded X on the fly:
             if (cfg.x_train_paths is None) and (not cfg.degrade_in_dataset):
                 with torch.no_grad():
                     x_mm = transform_to_mm(X[:, 0:1], cfg.transform)
@@ -1615,94 +1696,99 @@ def train(cfg: Config):
                     x_tr = mm_to_transform(x_mm, cfg.transform)
                     X = torch.cat([x_tr, X[:, 1:]], dim=1)
 
-            with autocast_cm():
-                out = model(X)
-                if isinstance(out, tuple):
-                    delta, aux = out
+            # Decide whether to all-reduce on this micro-step
+            is_sync_step = (((step + 1) % accum_steps) == 0)
+            ctx = nullcontext() if is_sync_step or (not ddp_is_initialized()) else model.no_sync()
+
+            with ctx:
+                with autocast_cm():
+                    out = model(X)
+                    if isinstance(out, tuple):   # supports deep supervision
+                        delta, aux = out
+                    else:
+                        delta, aux = out, None
+
+                    Y_pred_tr = apply_residual_gate_in_tr_space(
+                        X_tr=X[:, 0:1], delta_tr=delta, M=M,
+                        c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                    )
+
+                # FP32 fence section (unchanged)
+                with torch.autocast(device_type="cuda", enabled=False):
+                    Y_pred_tr_clamped = Y_pred_tr.clamp(0.0, 12.0).float()
+                    Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform).float()
+                    Y_true_mm = transform_to_mm(Y_true,            cfg.transform).float()
+                    Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
+                    Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
+                    spec = spectral_loss(Y_pred_tr * M, Y_true * M).float() * cfg.w_spec if cfg.w_spec > 0 \
+                           else torch.tensor(0., device=device)
+
+                # Main loss terms (unchanged)
+                if cfg.loss == "huber":
+                    data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
                 else:
-                    delta, aux = out, None
+                    data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+                gl   = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+                mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+                hp   = F.l1_loss(highpass(Y_pred_tr, 1.5) * M, highpass(Y_true, 1.5) * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
 
-                Y_pred_tr = apply_residual_gate_in_tr_space(
-                    X_tr=X[:, 0:1], delta_tr=delta, M=M,
-                    c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
-                )
+                loss = data_loss + gl + spec + mass + hp + fssl
+                loss = loss + 0.01 * (delta ** 2).mean()
 
- #           with autocast_cm():
- #               delta = model(X)
- #               Y_pred_tr = apply_residual_gate_in_tr_space(
- #                   X_tr=X[:, 0:1], delta_tr=delta, M=M,
- #                   c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
- #               )
+                # Deep supervision aux heads (if enabled)
+                if cfg.deep_supervision and aux is not None:
+                    ds_w = (cfg.ds_weights or [0.2, 0.1])
+                    aux_losses = []
+                    for i, key in enumerate(("aux1", "aux2")):
+                        if key not in aux or i >= len(ds_w) or ds_w[i] <= 0:
+                            continue
+                        aux_delta = aux[key]
+                        h, w = aux_delta.shape[-2:]
+                        X_ds = F.interpolate(X[:, 0:1],   size=(h, w), mode="area")
+                        Y_ds = F.interpolate(Y_true,      size=(h, w), mode="area")
+                        M_ds = F.interpolate(M,           size=(h, w), mode="nearest")
+                        with autocast_cm():
+                            Y_pred_aux = apply_residual_gate_in_tr_space(
+                                X_tr=X_ds, delta_tr=aux_delta, M=M_ds,
+                                c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
+                            )
+                            aux_data = F.smooth_l1_loss(Y_pred_aux * M_ds, Y_ds * M_ds) if cfg.loss == "huber" \
+                                      else F.l1_loss(Y_pred_aux * M_ds, Y_ds * M_ds)
+                        aux_losses.append(ds_w[i] * aux_data)
+                    if aux_losses:
+                        loss = loss + sum(aux_losses)
 
-            # Fence fragile components in FP32 once; reuse below
-            with torch.autocast(device_type="cuda", enabled=False):
-                Y_pred_tr_clamped = Y_pred_tr.clamp(0.0, 12.0).float()
-                Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform).float()
-                Y_true_mm = transform_to_mm(Y_true, cfg.transform).float()
-                Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
-                Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
-                # Masked FP32 spectral
-                spec = spectral_loss(Y_pred_tr * M, Y_true * M).float() * cfg.w_spec if cfg.w_spec > 0 else torch.tensor(0., device=device)
+                # Backward on scaled loss for accumulation
+                (loss / accum_steps).backward()
 
-            if cfg.loss == "huber":
-                data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
-            else:
-                data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
-
-            gl   = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
-            mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-            hp_pred = highpass(Y_pred_tr, sigma=1.5)
-            hp_true = highpass(Y_true,    sigma=1.5)
-            hp   = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-            fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
-
-            loss = data_loss + gl + spec + mass + hp + fssl
-
-            lambda_res = 0.01
-            loss = loss + lambda_res * (delta ** 2).mean()
-
-
-            # --- Deep supervision (optional) ---
-            if cfg.deep_supervision and aux is not None:
-                ds_w = (cfg.ds_weights or [0.2, 0.1])
-                aux_losses = []
-                for i, key in enumerate(("aux1", "aux2")):
-                    if key not in aux or i >= len(ds_w) or ds_w[i] <= 0:
-                        continue
-                    aux_delta = aux[key]
-                    h, w = aux_delta.shape[-2:]
-                    X_ds = F.interpolate(X[:, 0:1], size=(h, w), mode="area")
-                    Y_ds = F.interpolate(Y_true,    size=(h, w), mode="area")
-                    M_ds = F.interpolate(M,         size=(h, w), mode="nearest")
-                    with autocast_cm():
-                        Y_pred_aux = apply_residual_gate_in_tr_space(
-                            X_tr=X_ds, delta_tr=aux_delta, M=M_ds,
-                            c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
-                        )
-                        if cfg.loss == "huber":
-                            aux_data = F.smooth_l1_loss(Y_pred_aux * M_ds, Y_ds * M_ds)
-                        else:
-                            aux_data = F.l1_loss(Y_pred_aux * M_ds, Y_ds * M_ds)
-                    aux_losses.append(ds_w[i] * aux_data)
-                if aux_losses:
-                    loss = loss + sum(aux_losses)
-
-
-
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # gradient clipping seatbelt
-            opt.step()
+            # Only all-reduce (implicit) + step at sync boundaries
+            if is_sync_step:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
 
             running += float(loss.detach())
             if is_main and hasattr(steps_iter, "set_postfix") and (step % log_every == 0):
                 steps_iter.set_postfix(loss=running / log_every)
                 running = 0.0
 
+        # ---- Flush pending grads if expected_steps not divisible by accum_steps ----
+        if (expected_steps % accum_steps) != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
         del it_tr
 
+
         # --- Pre-validation rendezvous (all ranks) ---
+        # This is the single synchronization point AFTER training steps for the epoch.
+        # Keep it. Do not add more barriers until next epoch.
         _cuda_sync(); cpu_barrier()
+
+        from itertools import islice
+        import traceback
 
         # ============================
         # VALIDATION (rank 0 only)
@@ -1713,117 +1799,140 @@ def train(cfg: Config):
             va_losses, va_rmse, va_mae = [], [], []
             fss_scores: Dict[float, List[float]] = {thr: [] for thr in cfg.fss_thresholds}
             skipped_empty = 0
+            val_failed = 0
+            mean_val = float('inf')
 
-            with torch.no_grad(), autocast_cm():
-                for X, Y_true, M in tqdm(dl_va, desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
-                    X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-                    Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-                    M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            print("[val] probing first batch...", flush=True)
+            try:
+                it_va_probe = iter(dl_va)               # with num_workers=0, runs in main proc
+                Xp, Yp, Mp = next(it_va_probe)          # if it fails, it's __getitem__/collate
+                print("[val] got first batch", tuple(Xp.shape), flush=True)
+                del it_va_probe, Xp, Yp, Mp
+            except Exception as e:
+                print(f"[val] ERROR fetching first batch: {repr(e)}", flush=True)
+                traceback.print_exc()
+                val_failed = 1
+                mean_val = float('inf')                 # fail-safe metric
+            else:
+                # --- Run up to cfg.val_steps only ---
+                with torch.no_grad(), autocast_cm():
+                    it_va = iter(dl_va)
+                    n_val = int(getattr(cfg, "val_steps", 0) or 0)
+                    print(f"[val] val_steps = {n_val}", flush=True)
+                    iterable = islice(it_va, n_val) if n_val > 0 else iter(dl_va)
 
-                    if M.sum() <= 0:
-                        skipped_empty += 1
-                        continue
-                    delta_val = model(X)
-                    Y_pred_tr = apply_residual_gate_in_tr_space(
-                        X_tr=X[:, 0:1], delta_tr=delta_val, M=M,
-                        c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
-                    )
-                    if cfg.loss == "huber":
-                        data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
-                    else:
-                        data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+                    for X, Y_true, M in tqdm(iterable, total=(n_val if n_val > 0 else None),
+                                            desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
+                        X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                        Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                        M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
 
-                    gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+                        if M.sum() <= 0:
+                            skipped_empty += 1
+                            continue
 
-                    Y_pred_tr_clamped = Y_pred_tr.clamp(min=0.0, max=12.0)
-                    Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform)
-                    Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
-                    Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
-                    Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
-
-                    spec = spectral_loss(Y_pred_tr * M, Y_true * M) * cfg.w_spec if cfg.w_spec > 0 else 0.0
-                    mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-                    hp_pred = highpass(Y_pred_tr, sigma=1.5)
-                    hp_true = highpass(Y_true,    sigma=1.5)
-                    hp = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-                    fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
-
-                    vloss = data_loss + gl + spec + mass + hp + fssl
-                    va_losses.append(float(vloss.detach()))
-                    va_rmse.append(rmse(Y_pred_mm, Y_true_mm, mask=M).item())
-                    va_mae.append(mae(Y_pred_mm, Y_true_mm, mask=M).item())
-                    for thr in cfg.fss_thresholds:
-                        fss_scores[thr].append(
-                            fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
+                        delta_val = model(X)
+                        Y_pred_tr = apply_residual_gate_in_tr_space(
+                            X_tr=X[:, 0:1], delta_tr=delta_val, M=M,
+                            c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                         )
 
-            if len(va_losses) == 0:
-                mean_val  = float('inf')
-                mean_rmse = float('inf')
-                mean_mae  = float('inf')
-                mean_fss  = {thr: 0.0 for thr in cfg.fss_thresholds}
-                print(f"[Val] WARNING: all validation batches skipped (empty mask).", flush=True)
-            else:
-                mean_val  = float(np.mean(va_losses))
-                mean_rmse = float(np.mean(va_rmse))
-                mean_mae  = float(np.mean(va_mae))
-                mean_fss  = {thr: float(np.mean(v)) for thr, v in fss_scores.items()}
+                        if cfg.loss == "huber":
+                            data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
+                        else:
+                            data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
 
-            print(
-                f"[Val] loss={mean_val:.4f} rmse={mean_rmse:.3f} mae={mean_mae:.3f} "
-                + " ".join([f"FSS@{thr}={mean_fss[thr]:.3f}" for thr in cfg.fss_thresholds]),
-                flush=True
-            )
+                        gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+
+                        Y_pred_tr_clamped = Y_pred_tr.clamp(min=0.0, max=12.0)
+                        Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform)
+                        Y_true_mm = transform_to_mm(Y_true,    cfg.transform)
+                        Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
+                        Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
+
+                        spec = spectral_loss(Y_pred_tr * M, Y_true * M) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+                        mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+                        hp_pred = highpass(Y_pred_tr, sigma=1.5)
+                        hp_true = highpass(Y_true,    sigma=1.5)
+                        hp = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                        fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+
+                        vloss = data_loss + gl + spec + mass + hp + fssl
+                        va_losses.append(float(vloss.detach()))
+                        va_rmse.append(rmse(Y_pred_mm, Y_true_mm, mask=M).item())
+                        va_mae.append(mae(Y_pred_mm, Y_true_mm, mask=M).item())
+                        for thr in cfg.fss_thresholds:
+                            fss_scores[thr].append(
+                                fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
+                            )
+
+                if not val_failed:
+                    if len(va_losses) == 0:
+                        mean_val  = float('inf')
+                        mean_rmse = float('inf')
+                        mean_mae  = float('inf')
+                        mean_fss  = {thr: 0.0 for thr in cfg.fss_thresholds}
+                        print(f"[Val] WARNING: all validation batches skipped (empty mask).", flush=True)
+                    else:
+                        mean_val  = float(np.mean(va_losses))
+                        mean_rmse = float(np.mean(va_rmse))
+                        mean_mae  = float(np.mean(va_mae))
+                        mean_fss  = {thr: float(np.mean(v)) for thr, v in fss_scores.items()}
+
+                    print(
+                        f"[Val] loss={mean_val:.4f} rmse={mean_rmse:.3f} mae={mean_mae:.3f} "
+                        + " ".join([f"FSS@{thr}={mean_fss[thr]:.3f}" for thr in cfg.fss_thresholds]),
+                        flush=True
+                    )
         else:
             mean_val = float('inf')
 
+        # Rank-0 steps scheduler (no barrier), then broadcast LR to all ranks (already in your code)
         if is_main:
             scheduler.step(mean_val)
-            # Sync LR to other ranks
-            if ddp_is_initialized():
-                for pg in opt.param_groups:
-                    lr_t = torch.tensor([pg['lr']], device=device)
-                    dist.broadcast(lr_t, src=0)
-                    pg['lr'] = float(lr_t.item())
+        # Sync LR values to other ranks (no barrier needed)
+        if ddp_is_initialized():
+            for pg in opt.param_groups:
+                lr_t = torch.tensor([pg['lr']], device=device)
+                dist.broadcast(lr_t, src=0)
+                pg['lr'] = float(lr_t.item())
 
-        # --- Rendezvous ---
-        _cuda_sync(); cpu_barrier()
-        _cuda_sync(); cpu_barrier()
-
-        # Compute flags on rank-0; broadcast to all
+        # ======= DO NOT BARRIER HERE =======
+        # Compute flags on rank-0, broadcast to all ranks (no barrier)
         if is_main:
-            improved_flag = int(np.isfinite(mean_val) and (mean_val < best_val - 1e-5))
-            planned_best_val = float(min(best_val, mean_val))
-            planned_patience = 0 if improved_flag else (patience_ctr + 1)
-            should_stop_flag = int(epoch >= cfg.min_epochs and planned_patience >= cfg.patience)
+            improved_flag_local = int(np.isfinite(mean_val) and (mean_val < best_val - 1e-5))
+            planned_best_val_local = float(min(best_val, mean_val))
+            planned_patience_local = 0 if improved_flag_local else (patience_ctr + 1)
+            should_stop_flag_local = int(epoch >= cfg.min_epochs and planned_patience_local >= cfg.patience)
         else:
-            improved_flag = 0
-            planned_best_val = best_val
-            should_stop_flag = 0
+            improved_flag_local = 0
+            planned_best_val_local = best_val
+            should_stop_flag_local = 0
 
-        improved_flag    = ddp_broadcast_scalar(improved_flag,    device, torch.int32)
-        planned_best_val = ddp_broadcast_scalar(planned_best_val, device, torch.float32)
-        should_stop_flag = ddp_broadcast_scalar(should_stop_flag, device, torch.int32)
+        # Use your helper to broadcast scalars (keeps existing infra)
+        improved_flag    = ddp_broadcast_scalar(improved_flag_local,    device, torch.int32)
+        planned_best_val = ddp_broadcast_scalar(planned_best_val_local, device, torch.float32)
+        should_stop_flag = ddp_broadcast_scalar(should_stop_flag_local, device, torch.int32)
 
-        # Checkpoint rank-0 only
+        # Rank-0 updates trackers and saves checkpoints (NO barrier after)
         if is_main:
             state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
 
-            # Save "last" with full training state (for exact resume)
+            # Save "last" with full training state (resume)
             torch.save({
                 "model": state_dict,
                 "optimizer": opt.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
-                "best_val": best_val,
+                "best_val": best_val,   # note: updated below on improvement
                 "cfg": asdict(cfg)
             }, ckpt_last)
 
-            if improved_flag:
-                best_val = planned_best_val
+            if int(improved_flag) == 1:
+                best_val = float(planned_best_val)
                 best_epoch = epoch
                 patience_ctr = 0
-                # Save "best" with weights-only (for inference/warm-start)
+                # Save "best" with weights-only (inference/warm-start)
                 torch.save({
                     "model": state_dict,
                     "cfg": asdict(cfg),
@@ -1834,11 +1943,9 @@ def train(cfg: Config):
             else:
                 patience_ctr += 1
 
-        # End-of-epoch rendezvous (all ranks)
-        _cuda_sync(); cpu_barrier()
-
+        # ======= STILL NO BARRIER HERE =======
         # Early stop / epoch++
-        if should_stop_flag:
+        if int(should_stop_flag) == 1:
             if is_main:
                 print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch} (val={best_val:.6f})", flush=True)
             stop_training = True
@@ -2137,9 +2244,18 @@ def build_arg_parser():
     ap.add_argument("--prefetch_factor", type=int, default=None, help="Batches prefetched per worker (default: PyTorch default).")
     ap.add_argument("--persistent_workers", action="store_true", help="Keep DataLoader workers alive across epochs.")
 
-    ap.add_argument("--biased_crops", type=int, default=None, help="N ")
-    ap.add_argument("--biased_policy", type=int, default=None, help="Va")
-    ap.add_argument("--biased_warmup_epochs", type=int, default=None, help="")
+    ap.add_argument("--biased_crops", action="store_true", default=None, help="N ")
+    
+    # Policy name as a string; restrict to implemented strategies
+    ap.add_argument(
+        "--biased_policy",
+        type=str,
+        choices=["precip", "diff", "hybrid"],
+        default="precip",
+        help="Which biased sampler to use: 'precip' (foreground-aware), 'diff' (|X-Y|-aware), or 'hybrid'."
+    )
+
+    ap.add_argument("--biased_warmup_epochs", type=int, default=None, help="Epochs to gradually ramp from uniform to biased sampling")
 
     #Deeper UNET with 5 levels
     ap.add_argument("--num_levels", type=int, choices=[4, 5], default=4,
@@ -2215,7 +2331,6 @@ def main():
     # Save-as names
     cfg.best_name = args.best_name or args.ckpt_name or "best.pt"
     cfg.last_name = args.last_name or "last.pt"
-
 
 
     if args.mode == "train":
