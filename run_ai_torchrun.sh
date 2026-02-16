@@ -36,13 +36,17 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 #  --deep_supervision \
 #  --ds_weights 0.2 0.1
 
-torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
-  unet_radar_correction.py \
+#for torchrun, replace the next 2 lines with python unet_radar_correction.py \
+#torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
+#  unet_radar_correction.py \
+#  --biased_crops \
+
+python unet_radar_correction.py \
   --mode train \
   --out_dir /nfs/pancake/u5/projects/vachek/radar_ai/models/ \
-  --resume_from /nfs/pancake/u5/projects/vachek/radar_ai/models/best_torch.pt \
-  --best_name best_torch.pt \
-  --last_name last_torch.pt \
+  --resume_from /nfs/pancake/u5/projects/vachek/radar_ai/models/best_torch_diff_update.pt \
+  --best_name best_torch_diff_update.pt \
+  --last_name last_torch_diff_update.pt \
   --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train_opt.zarr \
   --val_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val_opt.zarr \
   --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train_opt.zarr \
@@ -50,20 +54,18 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
   --x_var ppt \
   --steps_per_epoch 3600 \
   --val_steps 200 \
-  --num_levels 5 \
-  --deep_supervision \
+  --num_levels 4 \
   --ds_weights 0.2 0.1 \
-  --batch_size 8 \
-  --val_steps 300 \
-  --num_workers 8 \
+  --patch 128  \
+  --timeslice_cache 8 \
+  --batch_size 32 \
+  --num_workers 4 \
   --val_num_workers 4 \
-  --prefetch_factor 3 \
-  --biased_crops \
-  --biased_policy precip \
+  --prefetch_factor 2 \
+  --persistent_workers \
+  --val_steps 300 \
+  --biased_policy diff \
   --biased_warmup_epochs 2 \
-  --patch 896  \
-  --timeslice_cache 256 \
-  --patch 896 \
   --domain_mask_npy /a1/unet/prism_domain_mask.npy \
   --climatology_npy /a1/unet/prism_daily_normals_366.npy \
   --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc \

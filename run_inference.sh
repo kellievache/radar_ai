@@ -13,7 +13,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 python unet_radar_correction.py \
   --mode infer \
-  --ckpt_path /nfs/pancake/u5/projects/vachek/radar_ai/models/best.pt \
+  --ckpt_path /nfs/pancake/u5/projects/vachek/radar_ai/models/last_torch.pt \
   --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc \
   --out_path  /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/ \
   --domain_mask_npy /a1/unet/prism_domain_mask.npy \

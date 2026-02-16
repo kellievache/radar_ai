@@ -36,34 +36,37 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 #  --deep_supervision \
 #  --ds_weights 0.2 0.1
 
-
-python unet_radar_correction.py \
+torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
+  unet_radar_correction.py \
   --mode train \
-  --num_levels 4 \
-  --out_dir /nfs/pancake/u5/projects/vachek/radar_ai/models/ \
-  --resume_from /nfs/pancake/u5/projects/vachek/radar_ai/models/best_radar_update.pt \
-  --best_name best__radar_update.pt \
-  --last_name last_radar.pt \
-  --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train_opt.zarr \
-  --val_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val_opt.zarr \
-  --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train_opt.zarr \
-  --x_val_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val_opt.zarr \
+  --out_dir /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/models/ \
+  --resume_from /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/models/best_torch.pt \
+  --best_name best_torch.pt \
+  --last_name last_torch.pt \
+  --train_paths /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/netcdf/y_train_opt.zarr \
+  --val_paths /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/netcdf/y_val_opt.zarr \
+  --x_train_paths /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/netcdf/x_train_opt.zarr \
+  --x_val_paths /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/netcdf/x_val_opt.zarr \
   --x_var ppt \
-  --steps_per_epoch 1200 \
-  --val_steps 400 \
-  --batch_size 8 \
-  --num_workers 12 \
-  --val_num_workers 6 \
+  --steps_per_epoch 3600 \
+  --val_steps 200 \
+  --num_levels 5 \
+  --deep_supervision \
+  --ds_weights 0.2 0.1 \
+  --batch_size 4 \
+  --val_steps 300 \
+  --num_workers 3 \
+  --val_num_workers 4 \
   --prefetch_factor 3 \
   --biased_crops \
   --biased_policy precip \
-  --biased_warmup_epochs  2 \
+  --biased_warmup_epochs 2 \
+  --patch 896  \
   --timeslice_cache 256 \
-  --patch 512 \
-  --domain_mask_npy /scratch/$USER/prism_domain_mask.npy \
-  --climatology_npy /scratch/$USER/prism_daily_normals_366.npy \
-  --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc \
-  --out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/ \
+  --domain_mask_npy /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/netcdf/prism_domain_mask.npy \
+  --climatology_npy /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/netcdf/prism_daily_normals_366.npy \
+  --pre_paths /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/netcdf/infer.nc \
+  --out_path /depot.engr.oregonstate.edu/users/hpc-share/radar_ai/output/ \
    
    
    

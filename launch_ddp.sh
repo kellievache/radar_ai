@@ -1,66 +1,126 @@
-
 #!/bin/bash
 set -euo pipefail
 
-
-# Absolute paths to the environment binaries
-ENV=/nfs/pancake/u2/home/vachek/miniconda3/envs/AG_15_PY312
-TORCHRUN=$ENV/bin/torchrun
-PYTHON=$ENV/bin/python
-
+# ---------- User settings ----------
+ENV=/nfs/pancake/u2/home/vachek/.conda/envs/AG_15_PY312
+#PROJECT_DIR=/depot.engr.oregonstate.edu/users/hpc-share/radar_ai
+PROJECT_DIR=smb://stak.engr.oregonstate.edu/users/vachek/
+SCRIPT=unet_radar_correction.py
 
 HOSTFILE=hosts.txt
-MASTER_PORT=29500
-NCCL_IFNAME=ib0    # change if needed (eth0, enp..., etc.)
+MASTER_PORT=29561
 
-mapfile -t NODES < "$HOSTFILE"
-NNODES=${#NODES[@]}
-MASTER_ADDR=${NODES[0]}
+# If you have InfiniBand, set to ib0; otherwise eth0 or your NIC name.
+NCCL_IFNAME=${NCCL_IFNAME:-eth0}
 
-CMD="torchrun \
-  --nnodes=$NNODES \
-  --nproc_per_node=1 \
-  --master_addr=$MASTER_ADDR \
-  --master_port=$MASTER_PORT \
-  unet_radar_correction3.py \
-    --mode train \
-    --ckpt /nfs/pancake/u5/projects/vachek/radar_ai/models/best_4km_prismcpu2.pt \
-    --train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_train.zarr \
-    --val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/y_val.zarr \
-    --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train.zarr \
-    --x_val_paths   /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val.zarr \
-    --x_var ppt \
-    --steps_per_epoch 1200 \
-    --val_steps 250 \
-    --batch_size 16 \
-    --domain_mask_npy /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/prism_domain_mask.npy \
-    --climatology_npy /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/prism_daily_normals_366.npy \
-    --out_dir /nfs/pancake/u5/projects/vachek/radar_ai/models/x \
-    --ckpt_name best_production_4km_prismcpu2.pt"
+# Per-GPU micro-batch that fits L4 24–25 GB safely
+PER_GPU_BATCH=4
 
-# Launch workers (rank 1..N-1)
+# Validation: start conservative; increase later
+VAL_NUM_WORKERS=0
+VAL_STEPS=300
+
+# Training: more steps to amortize validation
+STEPS_PER_EPOCH=7200
+
+# -----------------------------------
+TORCHRUN="$ENV/bin/torchrun"
+PYTHON="$ENV/bin/python"
+cd "$PROJECT_DIR"
+
+# Read "host:gpu_count" lines
+mapfile -t NODE_LINES < "$HOSTFILE"
+NNODES=${#NODE_LINES[@]}
+NODE_HOSTS=()
+NODE_GPUS=()
+
+for line in "${NODE_LINES[@]}"; do
+  host="${line%%:*}"
+  gpus="${line##*:}"
+  NODE_HOSTS+=("$host")
+  NODE_GPUS+=("$gpus")
+done
+
+MASTER_ADDR=${NODE_HOSTS[0]}
+
+# Common training args (edit paths as needed)
+TRAIN_ARGS=(
+  "$SCRIPT"
+  --mode train
+  --out_dir "$PROJECT_DIR/models/"
+  --resume_from "$PROJECT_DIR/models/best_torch.pt"
+  --best_name best_torch.pt
+  --last_name last_torch.pt
+  --train_paths "$PROJECT_DIR/netcdf/y_train_opt.zarr"
+  --val_paths   "$PROJECT_DIR/netcdf/y_val_opt.zarr"
+  --x_train_paths "$PROJECT_DIR/netcdf/x_train_opt.zarr"
+  --x_val_paths   "$PROJECT_DIR/netcdf/x_val_opt.zarr"
+  --x_var ppt
+  --num_levels 5
+  --deep_supervision
+  --ds_weights 0.2 0.1
+  --batch_size "$PER_GPU_BATCH"
+  --steps_per_epoch "$STEPS_PER_EPOCH"
+  --val_steps "$VAL_STEPS"
+  --num_workers 4
+  --val_num_workers "$VAL_NUM_WORKERS"
+  --prefetch_factor 3
+  --biased_crops
+  --biased_policy precip
+  --biased_warmup_epochs 2
+  --patch 896
+  --timeslice_cache 256
+  --domain_mask_npy /a1/unet/prism_domain_mask.npy
+  --climatology_npy /a1/unet/prism_daily_normals_366.npy
+)
+
+# Launch worker nodes (node_rank = 1..N-1)
 for i in $(seq 1 $((NNODES-1))); do
-  host=${NODES[$i]}
-  echo "Launching rank $i on $host"
+  host=${NODE_HOSTS[$i]}
+  gpus=${NODE_GPUS[$i]}
+  echo "[launcher] Starting node_rank=$i on $host with $gpus GPUs..."
+
   ssh "$host" "
+    set -euo pipefail
+    cd '$PROJECT_DIR'
+
     export NCCL_SOCKET_IFNAME=$NCCL_IFNAME
     export NCCL_DEBUG=INFO
     export TORCH_NCCL_BLOCKING_WAIT=1
     export NCCL_ASYNC_ERROR_HANDLING=1
-    cd /nfs/pancake/u5/projects/vachek/radar_ai
-    $CMD --node_rank=$i
+    # Optional: Uncomment for more logs
+    # export TORCH_DISTRIBUTED_DEBUG=DETAIL
+
+    '$TORCHRUN' \
+      --nnodes=$NNODES \
+      --nproc_per_node=$gpus \
+      --node_rank=$i \
+      --master_addr='$MASTER_ADDR' \
+      --master_port=$MASTER_PORT \
+      ${TRAIN_ARGS[@]}
   " &
 done
 
 sleep 3
 
-# Launch rank 0 last
-echo "Launching rank 0 on ${NODES[0]}"
+# Launch primary node last (node_rank = 0)
+host=${NODE_HOSTS[0]}
+gpus=${NODE_GPUS[0]}
+echo "[launcher] Starting node_rank=0 on $host with $gpus GPUs..."
+
 export NCCL_SOCKET_IFNAME=$NCCL_IFNAME
 export NCCL_DEBUG=INFO
 export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
-cd /nfs/pancake/u5/projects/vachek/radar_ai
-$CMD --node_rank=0
+# Optional: Uncomment for more logs
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
+
+"$TORCHRUN" \
+  --nnodes=$NNODES \
+  --nproc_per_node=$gpus \
+  --node_rank=0 \
+  --master_addr="$MASTER_ADDR" \
+  --master_port=$MASTER_PORT \
+  "${TRAIN_ARGS[@]}"
 
 wait

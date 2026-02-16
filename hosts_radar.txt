@@ -1,0 +1,2 @@
+prismgpu1.nacse.org:2:/nfs/pancake/u5/projects/vachek/radar_ai:/nfs/pancake/u2/home/vachek/.conda/envs/AG_15_PY312
+cn-w-2.hpc.engr.oregonstate.edu:4:/hpc-share/radar_ai:/nfs/hpc/share/vachek/AG_15_PY312

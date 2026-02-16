@@ -39,6 +39,11 @@ from torch.utils.data._utils.collate import default_collate
 from collections import OrderedDict
 import datetime as _dt
 
+
+import torch.multiprocessing as mp
+mp.set_start_method("spawn", force=True)
+
+
 # Silence noisy "Mean of empty slice" warnings globally
 warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
 
@@ -254,12 +259,12 @@ class Config:
     persistent_workers: bool = False
 
     # Loss weights
-    loss: str = "huber"     # 'l1'|'huber'
-    w_grad: float = 0.15
-    w_spec: float = 0.08
-    w_mass: float = 0.03
-    w_hp: float = 0.02
-    w_fss: float = 0.15
+    loss: str = "logcosh"     # 'l1'|'huber'
+    w_grad: float = 0.5
+    w_spec: float = 0.3
+    w_mass: float = 0.2
+    w_hp: float = 0.1
+    w_fss: float = 0.4
 
     # FSS thresholds (mm/day)
     fss_thresholds: List[float] = None
@@ -736,8 +741,8 @@ class XRRandomPatchDataset(Dataset):
         """
         # Example schedule: start 50% uniform, 50% biased; ramp to 10% / 90% by epoch 10.
         u_frac = max(0.10, 0.50 - 0.04 * epoch)  # clamp at 10%
-        if self._rng.random() < u_frac:
-            return self._random_sampler(idx)
+     #   if self._rng.random() < u_frac:
+     #       return self._random_sampler(idx)
 
         if policy == "diff" and (self.ds_x is not None):
             return self._nonuniform_sampler_diff(idx)
@@ -1417,6 +1422,7 @@ def train(cfg: Config):
         pin_memory=True,
         drop_last=True,
         persistent_workers=cfg.persistent_workers,
+        multiprocessing_context="spawn",
        # prefetch_factor=cfg.prefetch_factor,
         collate_fn=safe_collate
     )
