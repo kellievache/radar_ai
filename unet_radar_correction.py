@@ -7,6 +7,11 @@ Convective morphology correction for PRISM (PyTorch).
 - Residual U-Net with texture-aware losses (HP, spectral, FSS)
 """
 
+
+import multiprocessing
+multiprocessing.set_start_method("spawn", force=True)
+
+
 import os
 import json
 import random
@@ -41,7 +46,7 @@ import datetime as _dt
 
 
 import torch.multiprocessing as mp
-mp.set_start_method("spawn", force=True)
+
 
 
 # Silence noisy "Mean of empty slice" warnings globally
@@ -50,20 +55,80 @@ warnings.filterwarnings("ignore", message="Mean of empty slice", category=Runtim
 # ---------------------------
 # DDP helpers
 # ---------------------------
+
+
+from torch.utils.data import get_worker_info
+
+
+
+def logp(msg):
+    rk = os.environ.get("RANK", "NA")
+    print(f"[rank{rk}] {msg}", flush=True)
+
+
+def dataloader_worker_init(worker_id: int):
+    """
+    Top-level (picklable) init for DataLoader workers.
+    - prevent thread oversubscription inside workers
+    - reseed python/numpy per worker+rank
+    - reopen xarray datasets inside the worker (if dataset implements .reopen())
+    """
+    # 1) threads
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+    # 2) per-worker, per-rank seed
+    try:
+        rank = int(os.environ.get("RANK", "0"))
+    except Exception:
+        rank = 0
+    base_seed = torch.initial_seed() % (2**32)
+    seed = (base_seed + worker_id + 9973 * rank) % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    # 3) (re)open datasets in the worker
+    wi = get_worker_info()
+    if wi is not None:
+        ds = wi.dataset
+        if hasattr(ds, "reopen"):
+            try:
+                ds.reopen()
+            except Exception:
+                pass
+
+
 def ddp_is_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 def ddp_setup():
     """Initialize DDP if launched with torchrun."""
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         import datetime as dt
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            timeout=dt.timedelta(minutes=30)
-        )
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
+        # Newer PyTorch (≈2.3+) supports device_id for NCCL process groups.
+        try:
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                timeout=dt.timedelta(minutes=30),
+                device_id=local_rank # or torch.device(f"cuda:{local_rank}")
+            )
+        except TypeError:
+            # Older PyTorch without the device_id arg
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                timeout=dt.timedelta(minutes=30),
+            )
+
+
         return local_rank, dist.get_rank(), dist.get_world_size()
     else:
         return None, 0, 1  # single-process fallback
@@ -461,7 +526,6 @@ def _block_reduce_mask_fraction(arr_mask01: np.ndarray, f: int, thr: float):
     frac = _block_reduce_mean(arr_mask01.astype(np.float32), f)
     coarsemask = (frac >= float(thr)).astype(np.float32)
     return coarsemask, frac.astype(np.float32)
-
 # ---------------------------
 # Datasets
 # ---------------------------
@@ -469,6 +533,11 @@ class XRRandomPatchDataset(Dataset):
     """
     Streaming random (or tiled) patches directly from NetCDF/Zarr.
     Channels: [x_tr(mean,max), (dem?), mask, clim_tr] when coarsening is enabled.
+
+    NEW: If T==1 (e.g., Zarr variable 1x1024x2048), we materialize the full
+    Y (and X if present) into RAM once and slice from those arrays in __getitem__.
+    This completely removes Zarr/Dask from the hot path and fixes the stall you saw
+    with small patches and large batches.
     """
 
     def __init__(self, y_paths: List[str], x_paths: Optional[List[str]], cfg: Config, mode: str = "train"):
@@ -481,26 +550,29 @@ class XRRandomPatchDataset(Dataset):
 
         # Coarsening controls
         self.coarsen_factor = int(getattr(cfg, "coarsen_factor", 1))
-        self.coarsen_mode = str(getattr(cfg, "coarsen_mode", "mean_max")).lower()
-        self.mask_thr = float(getattr(cfg, "coarsen_mask_threshold", 0.5))
-        self.use_log1p = bool(getattr(cfg, "precip_log1p", False))
+        self.coarsen_mode   = str(getattr(cfg, "coarsen_mode", "mean_max")).lower()
+        self.mask_thr       = float(getattr(cfg, "coarsen_mask_threshold", 0.5))
+        self.use_log1p      = bool(getattr(cfg, "precip_log1p", False))
 
         # Open datasets
-        self.ds_y = open_multi_auto(y_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
+        self.ds_y  = open_multi_auto(y_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
         self.var_y = cfg.prism_var
         self.t_dim = cfg.time_name
-        v = self.ds_y[self.var_y]
+
+        v         = self.ds_y[self.var_y]
         self.y_dim = v.dims[-2]
         self.x_dim = v.dims[-1]
-        self.T = int(self.ds_y.sizes[self.t_dim])
-        self.H_fine = int(self.ds_y.sizes[self.y_dim])
-        self.W_fine = int(self.ds_y.sizes[self.x_dim])
+
+        self.T       = int(self.ds_y.sizes[self.t_dim])
+        self.H_fine  = int(self.ds_y.sizes[self.y_dim])
+        self.W_fine  = int(self.ds_y.sizes[self.x_dim])
 
         if x_paths:
-            self.ds_x = open_multi_auto(x_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
+            self.ds_x  = open_multi_auto(x_paths, time_dim=cfg.time_name, prefer_chunks_time1=True)
             self.var_x = cfg.x_var or cfg.prism_var
         else:
-            self.ds_x = None
+            self.ds_x  = None
+            self.var_x = None
 
         # Keep paths for reopen safety
         self._y_paths = list(y_paths)
@@ -526,15 +598,15 @@ class XRRandomPatchDataset(Dataset):
 
         # Precompute day-of-year (0..365)
         try:
-            doy = self.ds_y[self.t_dim].dt.dayofyear.values  # 1..366
-            self.doy_idx = (doy - 1).astype(np.int16)        # 0..365
+            doy         = self.ds_y[self.t_dim].dt.dayofyear.values  # 1..366
+            self.doy_idx = (doy - 1).astype(np.int16)                # 0..365
         except Exception:
             self.doy_idx = np.arange(self.T, dtype=np.int64) % 366
 
         # Time-slice caches
         self._cache_limit = int(getattr(cfg, "timeslice_cache", 3))
-        self._cache = {"y": OrderedDict(), "x": OrderedDict()}        # fine planes
-        self._cache_coarse = {"y": OrderedDict(), "x": OrderedDict()} # coarse planes mean/max
+        self._cache        = {"y": OrderedDict(), "x": OrderedDict()}        # fine planes
+        self._cache_coarse = {"y": OrderedDict(), "x": OrderedDict()}        # (mean,max) coarse planes
 
         # Statics (DEM / user mask) at fine res
         self.dem_fine = None
@@ -555,7 +627,7 @@ class XRRandomPatchDataset(Dataset):
 
         # Coarsen statics & geometry
         if self.coarsen_factor > 1:
-            f = self.coarsen_factor
+            f  = self.coarsen_factor
             Hc = (self.H_fine // f) * f
             Wc = (self.W_fine // f) * f
 
@@ -584,16 +656,65 @@ class XRRandomPatchDataset(Dataset):
         else:
             self.H = self.H_fine
             self.W = self.W_fine
-            self.domain_mask_coarse = None
-            self.dem_coarse = None
+            self.domain_mask_coarse   = None
+            self.dem_coarse           = None
             self.user_static_mask_coarse = None
-            self.clim_daily_coarse = None
+            self.clim_daily_coarse    = None
+
+        # ----------------------------------------------------------
+        # NEW: In-memory fast path (materialize Y/X when T==1)
+        # ----------------------------------------------------------
+        self._inmem_time1 = bool(getattr(cfg, "in_memory_time1", True)) and (self.T == 1)
+
+        # Holders for full-resolution planes and precomputed coarse planes
+        self._y_full_fine = None
+        self._x_full_fine = None
+        self._y_mean_coarse = None
+        self._y_max_coarse  = None
+        self._x_mean_coarse = None
+        self._x_max_coarse  = None
+
+        if self._inmem_time1:
+            # Helper: materialize a 2D slice [H_fine, W_fine] as float32 with NaNs -> 0
+            def _materialize2d(ds, var, t_idx: int) -> np.ndarray:
+                sl = ds[var].isel(**{self.t_dim: int(t_idx)})
+                import dask
+                with dask.config.set(scheduler="single-threaded"):
+                    arr = np.asarray(sl.compute().data, dtype=np.float32)
+                return np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
+
+            # Load Y (and X or reuse Y if missing) into RAM once
+            self._y_full_fine = _materialize2d(self.ds_y, self.var_y, 0)
+            if self.ds_x is not None:
+                self._x_full_fine = _materialize2d(self.ds_x, self.var_x, 0)
+            else:
+                self._x_full_fine = self._y_full_fine  # OK to alias
+
+            # Tighten LRU cache since T==1
+            self._cache_limit = min(self._cache_limit, 1)
+
+            # Precompute coarse mean/max once if coarsening
+            if self.coarsen_factor > 1:
+                f  = self.coarsen_factor
+                Hc = (self.H_fine // f) * f
+                Wc = (self.W_fine // f) * f
+
+                y_trim = self._y_full_fine[:Hc, :Wc]
+                x_trim = self._x_full_fine[:Hc, :Wc]
+
+                y_mean, y_max = _block_reduce_mean_max(y_trim, f)
+                x_mean, x_max = _block_reduce_mean_max(x_trim, f)
+
+                self._y_mean_coarse = y_mean.astype(np.float32)
+                self._y_max_coarse  = y_max.astype(np.float32)
+                self._x_mean_coarse = x_mean.astype(np.float32)
+                self._x_max_coarse  = x_max.astype(np.float32)
+        # ----------------------------------------------------------
 
         # Length & sampler
         if mode == "train":
             self.N = int(getattr(cfg, "train_crops_per_epoch", 20000))
-            #self._sampler = self._random_sampler
-            self._sampler = self._hybrid_sampler  # instead of self._random_sampler
+            self._sampler = self._hybrid_sampler   # ('diff' by default if ds_x present)
             self._rng = random.Random(cfg.seed)
         else:
             val_mode = getattr(cfg, "val_crop_mode", "random").lower()
@@ -608,15 +729,31 @@ class XRRandomPatchDataset(Dataset):
                 self._sampler = self._random_sampler
                 self._rng = random.Random(cfg.seed + 1)
 
-
     def set_epoch(self, epoch:int):
         self._epoch = int(epoch)
-
 
     def reseed(self, base_seed: int, epoch: int, rank: int):
         self._rng = random.Random(int(base_seed + epoch * 997 + rank))
 
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['ds_y'] = None
+        state['ds_x'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        try:
+            self.reopen()
+        except Exception:
+            pass
+
+
     def reopen(self):
+        # NEW: No-op if we fully materialized in-memory (T==1).
+        if getattr(self, "_inmem_time1", False):
+            return
         try:
             self.ds_y.close()
         except Exception:
@@ -633,7 +770,7 @@ class XRRandomPatchDataset(Dataset):
         return self.N
 
     def _random_sampler(self, idx):
-        t = self._rng.randrange(self.T)
+        t = self._rng.randrange(self.T)  # for T==1 this is always 0
         h = min(self.patch, self.H)
         w = min(self.patch, self.W)
         y0 = self._rng.randrange(0, max(1, self.H - h + 1))
@@ -644,66 +781,39 @@ class XRRandomPatchDataset(Dataset):
                                    thr_mm_log1p: float = None,
                                    accept_scale: float = 5.0,
                                    max_tries: int = 20):
-        """
-        Prefer windows that contain precip (foreground-aware sampling).
-        - thr_mm_log1p: threshold in transform space; if None, we compute on raw mm.
-        - accept_scale: higher → more likely to accept precip-heavy windows.
-        """
-        # Local shorthands
         H, W = self.H, self.W
         h = min(self.patch, H)
         w = min(self.patch, W)
-
-        # Choose a transform-aware threshold if you want to work in transform space.
-        # For simplicity we use raw mm here and threshold at 0.1 mm.
         precip_thr_mm = 0.1
 
         for _ in range(max_tries):
             t = self._rng.randrange(self.T)
             y0 = self._rng.randrange(0, max(1, H - h + 1))
             x0 = self._rng.randrange(0, max(1, W - w + 1))
-
-            # Get fine plane from cache (your helper is already efficient)
-            y_fine = self._get_plane("y", t)  # [H_fine,W_fine] or coarse if coarsen_factor==1
-            patch = y_fine[y0:y0+h, x0:x0+w]
-
-            # Foreground fraction (precip present)
+            y_fine = self._get_plane("y", t)        # [H_fine, W_fine]
+            patch  = y_fine[y0:y0+h, x0:x0+w]
             fg_frac = float((patch > precip_thr_mm).mean()) if patch.size else 0.0
-
-            # Accept with probability proportional to foreground fraction
-            # (cap to [0,1] via 1 - exp or min)
             import math
-            p_accept = 1.0 - math.exp(-accept_scale * fg_frac)  # smooth monotonic
+            p_accept = 1.0 - math.exp(-accept_scale * fg_frac)
             if self._rng.random() < p_accept:
                 return t, y0, x0, h, w
 
-        # Fallback to uniform if we didn't accept in max_tries
         t = self._rng.randrange(self.T)
         y0 = self._rng.randrange(0, max(1, H - h + 1))
         x0 = self._rng.randrange(0, max(1, W - w + 1))
         return t, y0, x0, h, w
 
-    #If using external Y (which we do) use this sampler to find places where they differ.
     def _nonuniform_sampler_diff(self, idx,
-                                 err_percentile: float = 70.0,
                                  accept_scale: float = 5.0,
                                  max_tries: int = 20):
-        """
-        Prefer windows where |X - Y| is large (difference-aware sampling).
-        err_percentile controls a soft cutoff: patches above this percentile
-        of error are much more likely to be accepted.
-        """
         H, W = self.H, self.W
         h = min(self.patch, H)
         w = min(self.patch, W)
         has_x = (self.ds_x is not None)
 
-        # If no X is provided, fall back to precip-weighted
         if not has_x:
             return self._nonuniform_sampler_precip(idx)
 
-        # Precompute a robust error scale from a few random spots (optional cache)
-        # Here we just use a fixed percentile logic per trial for simplicity.
         for _ in range(max_tries):
             t = self._rng.randrange(self.T)
             y0 = self._rng.randrange(0, max(1, H - h + 1))
@@ -714,41 +824,25 @@ class XRRandomPatchDataset(Dataset):
             y_patch = y_fine[y0:y0+h, x0:x0+w]
             x_patch = x_fine[y0:y0+h, x0:x0+w]
 
-            # Absolute error (clip inf/nan)
-            import numpy as np
             err = np.abs(np.nan_to_num(y_patch, 0.0) - np.nan_to_num(x_patch, 0.0))
             mean_err = float(err.mean())
 
-            # Map error to acceptance probability using a soft sigmoid
-            # You can also compute a dynamic threshold across a few random samples and compare to percentile.
             import math
-            p_accept = 1.0 - math.exp(-accept_scale * mean_err)  # smooth, monotonic
-
+            p_accept = 1.0 - math.exp(-accept_scale * mean_err)
             if self._rng.random() < p_accept:
                 return t, y0, x0, h, w
 
-        # Fallback
         t = self._rng.randrange(self.T)
         y0 = self._rng.randrange(0, max(1, H - h + 1))
         x0 = self._rng.randrange(0, max(1, W - w + 1))
         return t, y0, x0, h, w
 
-    
     def _hybrid_sampler(self, idx, epoch: int = 0, policy: str = "diff"):
-        """
-        Blend uniform and biased sampling with an epoch-dependent schedule.
-        - policy: "precip", "diff", or "hybrid"
-        """
-        # Example schedule: start 50% uniform, 50% biased; ramp to 10% / 90% by epoch 10.
-        u_frac = max(0.10, 0.50 - 0.04 * epoch)  # clamp at 10%
-     #   if self._rng.random() < u_frac:
-     #       return self._random_sampler(idx)
-
+        u_frac = max(0.10, 0.50 - 0.04 * epoch)
         if policy == "diff" and (self.ds_x is not None):
             return self._nonuniform_sampler_diff(idx)
         else:
             return self._nonuniform_sampler_precip(idx)
-
 
     def _make_tiles(self, tile, overlap):
         step = tile - overlap
@@ -765,6 +859,17 @@ class XRRandomPatchDataset(Dataset):
         return self.tiles[idx]
 
     def _window(self, ds, var, t, y0, x0, h, w):
+        # NEW: In-memory path avoids Dask/Zarr entirely when T==1
+        if getattr(self, "_inmem_time1", False):
+            if ds is self.ds_y:
+                src = self._y_full_fine
+            elif ds is self.ds_x:
+                src = self._x_full_fine
+            else:
+                raise RuntimeError("Unknown dataset in _window with _inmem_time1.")
+            return np.asarray(src[y0:y0+h, x0:x0+w], dtype=np.float32)
+
+        # Original Dask compute path for T>1
         sl = ds[var].isel(**{self.t_dim: t, self.y_dim: slice(y0, y0 + h), self.x_dim: slice(x0, x0 + w)})
         import dask
         with dask.config.set(scheduler="single-threaded"):
@@ -774,35 +879,53 @@ class XRRandomPatchDataset(Dataset):
     def _get_plane(self, which: str, t: int) -> np.ndarray:
         """Fine resolution plane [H_fine, W_fine]."""
         assert which in ("y", "x")
+
+        # NEW: In-memory fast path when T==1
+        if getattr(self, "_inmem_time1", False):
+            return self._y_full_fine if which == "y" else self._x_full_fine
+
+        # Original cache + Zarr/Dask path for T>1
         cache = self._cache[which]
         if t in cache:
             arr = cache.pop(t)
             cache[t] = arr
             return arr
 
-        ds = self.ds_y if which == "y" else self.ds_x
+        ds  = self.ds_y if which == "y" else self.ds_x
         if ds is None:
             raise RuntimeError(f"_get_plane({which}, t={t}) requested but ds is None.")
         var = self.var_y if which == "y" else self.var_x
 
         sl = ds[var].isel(**{self.t_dim: t})
-
         import dask
         with dask.config.set(scheduler="single-threaded"):
-            arr = np.asarray(sl.compute().data, dtype=np.float32)  # [H_fine, W_fine]
+            arr = np.asarray(sl.compute().data, dtype=np.float32)
 
+        arr = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
         cache[t] = arr
         while len(cache) > self._cache_limit:
             cache.popitem(last=False)
         return arr
 
-    # Coarse plane getter with mean+max for precip
     def _get_plane_coarse_precip(self, which: str, t: int):
         """
         Returns (mean_coarse, max_coarse) at coarse resolution [H, W].
         Uses LRU cache and trims to divisibility by factor.
         """
         assert which in ("y", "x")
+
+        # NEW: In-memory fast path
+        if getattr(self, "_inmem_time1", False):
+            if self.coarsen_factor <= 1:
+                fine = self._y_full_fine if which == "y" else self._x_full_fine
+                return fine, fine
+            else:
+                if which == "y":
+                    return self._y_mean_coarse, self._y_max_coarse
+                else:
+                    return self._x_mean_coarse, self._x_max_coarse
+
+        # Original path for T>1
         if self.coarsen_factor <= 1:
             fine = self._get_plane(which, t)
             return fine, fine
@@ -838,7 +961,7 @@ class XRRandomPatchDataset(Dataset):
         m = (m_data * m_dom).astype(np.float32)
         if self.user_static_mask_fine is not None:
             usm = self.user_static_mask_coarse if self.coarsen_factor > 1 else self.user_static_mask_fine
-            m = (m * (usm[y0:y0+h, x0:x0+w] > 0.5).astype(np.float32)).astype(np.float32)
+            m   = (m * (usm[y0:y0+h, x0:x0+w] > 0.5).astype(np.float32)).astype(np.float32)
 
         # 3) Sanitize Y
         y_mean = np.where(m > 0.5, np.clip(y_mean, 0.0, 1e6), 0.0).astype(np.float32)
@@ -865,19 +988,19 @@ class XRRandomPatchDataset(Dataset):
             x_mean_np = np.log1p(np.clip(x_mean_np, 0.0, 1e6)).astype(np.float32)
             x_max_np  = np.log1p(np.clip(x_max_np,  0.0, 1e6)).astype(np.float32)
 
-        x_mean_t = torch.from_numpy(np.where(m > 0.5, x_mean_np, 0.0))[None, ...]
-        x_max_t  = torch.from_numpy(np.where(m > 0.5, x_max_np,  0.0))[None, ...]
+        m_torch   = torch.from_numpy(m)[None, ...]
+        x_mean_t  = torch.from_numpy(np.where(m > 0.5, x_mean_np, 0.0))[None, ...]
+        x_max_t   = torch.from_numpy(np.where(m > 0.5, x_max_np,  0.0))[None, ...]
 
         # 5) Transform to training space + light noise
-        y_tr       = mm_to_transform(y_t, self.transform).float()
-        x_mean_tr  = mm_to_transform(x_mean_t, self.transform).float()
-        x_max_tr   = mm_to_transform(x_max_t,  self.transform).float()
+        y_tr      = mm_to_transform(y_t, self.transform).float()
+        x_mean_tr = mm_to_transform(x_mean_t, self.transform).float()
+        x_max_tr  = mm_to_transform(x_max_t,  self.transform).float()
 
-        x_mean_tr  = add_noise_transformed(x_mean_tr, self.cfg.degrade_additive_noise_std)
-        x_max_tr   = add_noise_transformed(x_max_tr,  self.cfg.degrade_additive_noise_std)
+        x_mean_tr = add_noise_transformed(x_mean_tr, self.cfg.degrade_additive_noise_std)
+        x_max_tr  = add_noise_transformed(x_max_tr,  self.cfg.degrade_additive_noise_std)
 
         # Mask after transform
-        m_torch = torch.from_numpy(m)[None, ...]
         x_mean_tr = x_mean_tr * m_torch
         x_max_tr  = x_max_tr  * m_torch
 
@@ -908,23 +1031,17 @@ class XRRandomPatchDataset(Dataset):
         Y = y_tr.float()                     # [1, h, w]
         M = m_torch.float()                  # [1, h, w]
 
-        if not (torch.is_tensor(X) and torch.is_tensor(Y) and torch.is_tensor(M)):
-            raise RuntimeError("Dataset produced non-tensor outputs")
-        
-
-        # assuming you already built X, Y, M as torch tensors: [C,H,W], [1,H,W], [1,H,W]
         if self.mode == "val":
-            P = int(self.patch)  # 896 or 1024
+            P = int(self.patch)
             H, W = X.shape[-2:]
             if H != P or W != P:
-                # pad order: (left, right, top, bottom) for 2D → (W-left, W-right, H-top, H-bottom)
                 dh = max(0, P - H)
                 dw = max(0, P - W)
-                pad2d = (0, dw, 0, dh)
+                pad2d = (0, dw, 0, dh)  # (W-left, W-right, H-top, H-bottom)
                 X = F.pad(X, pad2d, mode="constant", value=0.0)
                 Y = F.pad(Y, pad2d, mode="constant", value=0.0)
-                # zero mask on padded region so it doesn't contribute to the loss/metrics
                 M = F.pad(M, pad2d, mode="constant", value=0.0)
+
         return X, Y, M
 
 # ---------------------------
@@ -1049,46 +1166,6 @@ class ClimateUNetFlex(nn.Module):
             else:
                 self.aux1 = OutConv(base_ch*8  // factor, 1)  # after up1 (H/8)
                 self.aux2 = OutConv(base_ch*4  // factor, 1)  # after up2 (H/4)
-
-    def forward(self, x):
-        # ---- Encoder ----
-        x1 = self.inc(x)     # H
-        x2 = self.down1(x1)  # H/2
-        x3 = self.down2(x2)  # H/4
-        x4 = self.down3(x3)  # H/8
-        x5 = self.down4(x4)  # H/16
-
-        if self.num_levels == 5:
-            x6 = self.down5(x5)  # H/32
-
-            # ---- Decoder (collect features for aux heads) ----
-            y  = self.up1(x6, x5)     # H/16
-            feat1 = y
-            y  = self.up2(y,  x4)     # H/8
-            feat2 = y
-            y  = self.up3(y,  x3)     # H/4
-            y  = self.up4(y,  x2)     # H/2
-            y  = self.up5(y,  x1)     # H
-        else:
-            y  = self.up1(x5, x4)     # H/8
-            feat1 = y
-            y  = self.up2(y,  x3)     # H/4
-            feat2 = y
-            y  = self.up3(y,  x2)     # H/2
-            y  = self.up4(y,  x1)     # H
-
-        main_delta = self.outc(y)     # [B,1,H,W]
-
-        # In eval or if deep supervision disabled → return main only
-        if (not self.training) or (not self.deep_supervision):
-            return main_delta
-
-        # Training + deep supervision → return main + aux dict
-        aux = {
-            "aux1": self.aux1(feat1),   # deepest decoder scale
-            "aux2": self.aux2(feat2),   # next decoder scale
-        }
-        return main_delta, aux
 
     def forward(self, x):
         # Encoder
@@ -1333,17 +1410,31 @@ def safe_collate(batch):
     # ---- 3) standard stacking ----
     return default_collate(fixed)
 
+
+
+
 def train(cfg: Config):
-    import torch.multiprocessing as mp
-    import time
+    import os, json, time, random
     import numpy as np
+    import torch
+    import torch.nn.functional as F
+    import torch.distributed as dist
+    from torch.utils.data import DataLoader
     from contextlib import nullcontext
+    import torch.multiprocessing as mp
     import dask
 
-    mp.set_start_method("spawn", force=True)
-    mp.set_sharing_strategy("file_system")  # fewer semaphore issues with many workers
+    # ---------------------------
+    # Multiprocessing & runtime knobs
+    # ---------------------------
 
-    # single-threaded dask within each worker/process
+    # Sharing strategy reduces semaphore pressure on some HPC systems
+    try:
+        mp.set_sharing_strategy("file_system")
+    except Exception:
+        pass
+
+    # Single-threaded dask inside workers/processes
     try:
         dask.config.set(scheduler="single-threaded")
     except Exception:
@@ -1354,12 +1445,20 @@ def train(cfg: Config):
     except Exception:
         pass
 
+    # cuDNN autotune for repeated shapes (boosts small patch perf)
+    torch.backends.cudnn.benchmark = True
+
+    # ---------------------------
+    # Repro & output dirs
+    # ---------------------------
     set_seed(cfg.seed)
     ensure_dir(cfg.out_dir)
     with open(os.path.join(cfg.out_dir, "config.json"), "w") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    # --- DDP setup & device ---
+    # ---------------------------
+    # DDP setup & device
+    # ---------------------------
     local_rank, global_rank, world_size = ddp_setup()
     if local_rank is not None:
         device = torch.device(f"cuda:{local_rank}")
@@ -1368,13 +1467,10 @@ def train(cfg: Config):
         device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         is_main = True
 
-    # Resolve save paths (filenames under out_dir)
     best_name = getattr(cfg, "best_name", None) or "best.pt"
     last_name = getattr(cfg, "last_name", None) or "last.pt"
     ckpt_best = os.path.join(cfg.out_dir, best_name)
     ckpt_last = os.path.join(cfg.out_dir, last_name)
-
-    # Preferred explicit resume path (full path)
     resume_from = getattr(cfg, "resume_from", None)
 
     if is_main:
@@ -1387,84 +1483,98 @@ def train(cfg: Config):
     best_epoch = -1
     patience_ctr = 0
 
-    # CPU/Gloo group for coarse rendezvous
-    cpu_pg = None
-    if ddp_is_initialized():
-        cpu_pg = dist.new_group(backend="gloo")
 
-    def cpu_barrier():
-        if cpu_pg is not None:
-            dist.barrier(group=cpu_pg)
+    def barrier():
+        if ddp_is_initialized():
+            dist.barrier()
 
     def _cuda_sync():
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
-    # --- Datasets ---
-    ds_tr = XRRandomPatchDataset(y_paths=cfg.prism_train_paths,
-                                 x_paths=cfg.x_train_paths, cfg=cfg, mode="train")
-    
-    
+    # ---------------------------
+    # Datasets
+    # ---------------------------
+    ds_tr = XRRandomPatchDataset(
+        y_paths=cfg.prism_train_paths,
+        x_paths=cfg.x_train_paths,
+        cfg=cfg, mode="train"
+    )
+
+    # Lock-step steps_per_epoch support
     if getattr(cfg, "steps_per_epoch", 0):
         world = world_size if ddp_is_initialized() else 1
         ds_tr.N = int(cfg.steps_per_epoch) * int(cfg.batch_size) * int(world)
         if is_main:
-            print(f"[train] overriding ds_tr.N to {ds_tr.N} for steps_per_epoch={cfg.steps_per_epoch}, "
-                f"bs={cfg.batch_size}, world={world}", flush=True)
+            print(f"[train] overriding ds_tr.N to {ds_tr.N} (steps_per_epoch={cfg.steps_per_epoch}, "
+                  f"bs={cfg.batch_size}, world={world})", flush=True)
 
+    # Keep validation on rank-0 to avoid duplicated work
+    dl_va = None
+    if is_main:
+        ds_va = XRRandomPatchDataset(
+            y_paths=cfg.prism_val_paths,
+            x_paths=cfg.x_val_paths,
+            cfg=cfg, mode="val"
+        )
+        val_num_workers = int(getattr(cfg, "val_num_workers", 0) or 0)
+        dl_va = DataLoader(
+            ds_va,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=val_num_workers,
+            pin_memory=True,
+            persistent_workers=False,  # must be False when num_workers=0
+            collate_fn=safe_collate,
+            timeout=0
+        )
+
+    # ---------------------------
+    # DataLoader (train)
+    # ---------------------------
+    # The dataset samples randomly; shuffling indices is unnecessary and adds overhead.
+
+
+    num_workers = int(getattr(cfg, "num_workers", 0) or 0)
+    # guard features only valid with workers
+    if num_workers > 0:
+        persistent_workers = bool(getattr(cfg, "persistent_workers", False))
+        prefetch_factor = int(getattr(cfg, "prefetch_factor", 2) or 2)
+        multiprocessing_context = "spawn"  # safer with netCDF/xarray
+        worker_init_fn = dataloader_worker_init
+    else:
+        persistent_workers = False
+        prefetch_factor = None
+        multiprocessing_context = None
+        worker_init_fn = None
 
     dl_tr = DataLoader(
         ds_tr,
         batch_size=cfg.batch_size,
         sampler=None,
         shuffle=False,
-        num_workers=cfg.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=cfg.persistent_workers,
-        multiprocessing_context="spawn",
-       # prefetch_factor=cfg.prefetch_factor,
-        collate_fn=safe_collate
+        persistent_workers=persistent_workers,
+        collate_fn=safe_collate,
+        **({} if prefetch_factor is None else {"prefetch_factor": prefetch_factor}),
+        **({} if multiprocessing_context is None else {"multiprocessing_context": multiprocessing_context}),
+        **({} if worker_init_fn is None else {"worker_init_fn": worker_init_fn}),
     )
 
-    dl_va = None
-    if is_main:
-        ds_va = XRRandomPatchDataset(y_paths=cfg.prism_val_paths,
-                                     x_paths=cfg.x_val_paths, cfg=cfg, mode="val")
-       # dl_va = DataLoader(
-       #     ds_va,
-       #     batch_size=cfg.batch_size,
-       #     shuffle=False,
-       #     #num_workers=cfg.val_num_workers,
-       #     num_workers=0,  # set to 0 for validation to avoid potential deadlocks and speed up small eval sets
-       #     pin_memory=True,
-       #     #persistent_workers=cfg.persistent_workers,
-       #     persistent_workers=False,
-       #    # prefetch_factor=cfg.prefetch_factor,
-       #     collate_fn=safe_collate
-       # )
-
-        val_num_workers = 0
-        dl_va = DataLoader(
-            ds_va, batch_size=cfg.batch_size, shuffle=False,
-            num_workers=val_num_workers, pin_memory=True,
-            persistent_workers=False, collate_fn=safe_collate,
-            timeout=0   # required for num_workers=0
-        )
-
-    # --- Model ---
+    # ---------------------------
+    # Model
+    # ---------------------------
     has_dem = bool(
         cfg.use_dem and (
             getattr(ds_tr, "dem_fine", None) is not None or
             getattr(ds_tr, "dem_coarse", None) is not None
         )
     )
-
     coarsen_mode = str(getattr(cfg, "coarsen_mode", "mean_max")).lower()
     n_precip_in = 2 if coarsen_mode == "mean_max" else 1
-
-    # Total input channels: precip*, (+DEM?), mask, climatology
-    in_ch = n_precip_in + (1 if has_dem else 0) + 1 + 1
+    in_ch = n_precip_in + (1 if has_dem else 0) + 1 + 1  # precip*, (dem?), mask, clim
 
     model = ClimateUNetFlex(
         in_ch=in_ch,
@@ -1474,23 +1584,28 @@ def train(cfg: Config):
     ).to(device)
     model = model.to(memory_format=torch.channels_last)
 
-    # --- Optimizer & Scheduler (create BEFORE loading states) ---
+    # ---------------------------
+    # Optimizer / Scheduler
+    # ---------------------------
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 
     amp_warmup_epochs = 5
-    def autocast_cm():
-        use_amp = (cfg.amp and (epoch > amp_warmup_epochs) and device.type == 'cuda')
+    def autocast_cm(epoch_val=None):
+        use_amp = (cfg.amp and (device.type == 'cuda') and
+                   (epoch_val is not None) and (epoch_val > amp_warmup_epochs))
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=30, threshold=1e-5
     )
 
-    # ---- Gradient accumulation (reduce all-reduces under DDP) ----
-    accum_steps = 2   # or 4; tune based on VRAM/throughput
+    accum_steps = int(getattr(cfg, "accum_steps", 2) or 2)
 
-    # --- Load checkpoint if exists (weights, opt, scheduler) ---
+    # ---------------------------
+    # Resume (weights, opt, sched)
+    # ---------------------------
     start_epoch = 1
+    ckpt_loaded = False
 
     def _load_full_training_state(ckpt_obj):
         nonlocal start_epoch, best_val
@@ -1498,22 +1613,17 @@ def train(cfg: Config):
         start_epoch = ckpt_obj.get("epoch", 0) + 1
         best_val = ckpt_obj.get("best_val", float('inf'))
         if "optimizer" in ckpt_obj:
-            try:
-                opt.load_state_dict(ckpt_obj["optimizer"])
+            try: opt.load_state_dict(ckpt_obj["optimizer"])
             except Exception as e:
                 if is_main: print(f"[resume] optimizer state load failed: {e}")
         if "scheduler" in ckpt_obj:
-            try:
-                scheduler.load_state_dict(ckpt_obj["scheduler"])
+            try: scheduler.load_state_dict(ckpt_obj["scheduler"])
             except Exception as e:
                 if is_main: print(f"[resume] scheduler state load failed: {e}")
 
     def _load_weights_only(ckpt_obj):
         load_weights_robust(model, ckpt_obj)
 
-    ckpt_loaded = False
-
-    # 1) Try explicit --resume_from (full path)
     if resume_from and os.path.exists(resume_from):
         with open(resume_from, "rb") as f:
             ckpt = torch.load(f, map_location=device)
@@ -1522,26 +1632,22 @@ def train(cfg: Config):
         else:
             _load_weights_only(ckpt)
         ckpt_loaded = True
-        if is_main:
-            print(f"[resume] Loaded from --resume_from: {resume_from}")
-
-    # 2) Else try <out_dir>/<last_name>
+        if is_main: print(f"[resume] Loaded from --resume_from: {resume_from}")
     elif os.path.exists(ckpt_last):
         with open(ckpt_last, "rb") as f:
             ckpt = torch.load(f, map_location=device)
         _load_full_training_state(ckpt)
         ckpt_loaded = True
-        if is_main:
-            print(f"[resume] Loaded from last checkpoint: {ckpt_last}")
-
-    # 3) Else fresh
-    if not ckpt_loaded and is_main:
-        print("[resume] No checkpoint loaded (fresh training).")
+        if is_main: print(f"[resume] Loaded from last checkpoint: {ckpt_last}")
+    else:
+        if is_main: print("[resume] No checkpoint loaded (fresh training).")
 
     if is_main and ckpt_loaded:
         print(f"[resume] Resuming from epoch {start_epoch}, best_val={best_val}")
 
-    # --- Wrap once: DDP if torchrun, else DP as fallback for multi-GPU ---
+    # ---------------------------
+    # Wrap with DDP if available
+    # ---------------------------
     if ddp_is_initialized():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[device.index], output_device=device.index,
@@ -1550,30 +1656,58 @@ def train(cfg: Config):
     elif torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
-    # Steps per epoch (lock-step)
+    # ---------------------------
+    # Epoch/step planning
+    # ---------------------------
     world = world_size if ddp_is_initialized() else 1
-    per_rank_bs = cfg.batch_size
-    expected_steps = ds_tr.N // (per_rank_bs * world)
+    per_rank_bs = int(cfg.batch_size)
+    expected_steps = max(1, ds_tr.N // (per_rank_bs * world))
+    if is_main:
+        print(f"[train] effective steps/epoch = {expected_steps}  (N={ds_tr.N}, world={world}, bs/rank={per_rank_bs})")
 
     epoch = start_epoch
     stop_training = False
 
-    while (epoch <= cfg.epochs) and (not stop_training):
-        # --- Epoch header (light warm-up) ---
-        _cuda_sync(); cpu_barrier()
+
+    # quick test inside train(), before your real loop
+    # This just generates random inputs rather than finding them on a disk.  So it removes the disk as a b
+   # B, C, H, W = cfg.batch_size, in_ch, 128, 128  # adjust in_ch as built
+   # X = torch.randn(B, C, H, W, device=device).to(memory_format=torch.channels_last)
+   # Y = torch.randn(B, 1, H, W, device=device).to(memory_format=torch.channels_last)
+   # M = torch.ones(B, 1, H, W, device=device)
+
+   # model.train()
+   # torch.cuda.synchronize(); t0 = time.time()
+   # for _ in range(10000):
+   #     out = model(X)
+   #     if isinstance(out, tuple): out = out[0]
+   #     loss = (out - Y).abs().mean()
+   #     loss.backward()
+   #     opt.step(); opt.zero_grad(set_to_none=True)
+   # torch.cuda.synchronize(); print("synthetic 100 steps:", time.time()-t0)
+
+
+    # ---------------------------
+    # Training loop
+    # ---------------------------
+    while (epoch <= cfg.epochs) and (not stop_training): 
+        _cuda_sync(); barrier()
 
         if hasattr(ds_tr, "reseed"):
             ds_tr.reseed(cfg.seed, epoch, global_rank)
         if hasattr(ds_tr, "set_epoch"):
             ds_tr.set_epoch(epoch)
 
+        # Optional slight stagger to reduce simultaneous I/O bursts
         time.sleep(0.25 * (global_rank if ddp_is_initialized() else 0))
+
+        # Warm a plane on rank-0 (e.g., to load in-memory path); then rendezvous
         if is_main:
             tw = 0
             _ = ds_tr._get_plane("y", tw)
             if ds_tr.ds_x is not None:
                 _ = ds_tr._get_plane("x", tw)
-        _cuda_sync(); cpu_barrier()
+        _cuda_sync(); barrier()
 
         # ============================
         # TRAIN
@@ -1587,6 +1721,7 @@ def train(cfg: Config):
         # ---- Prefetch STEP 0 ----
         try:
             X0, Y0, M0 = next(it_tr)
+            logp(f"X0={tuple(X0.shape)} Y0={tuple(Y0.shape)} M0={tuple(M0.shape)}")  # per-rank
         except StopIteration:
             raise RuntimeError(f"Rank {global_rank}: no first batch for epoch {epoch}")
 
@@ -1602,18 +1737,16 @@ def train(cfg: Config):
                 x_tr = mm_to_transform(x_mm, cfg.transform)
                 X0 = torch.cat([x_tr, X0[:, 1:]], dim=1)
 
-        # Clear grads at the start of the accumulation window
         opt.zero_grad(set_to_none=True)
 
-        # Determine if this micro-step should all-reduce (sync) or not
         step0 = 0
         is_sync_step0 = (((step0 + 1) % accum_steps) == 0)
         ctx0 = nullcontext() if is_sync_step0 or (not ddp_is_initialized()) else model.no_sync()
 
         with ctx0:
-            with autocast_cm():
+            with autocast_cm(epoch):
                 out0 = model(X0)
-                if isinstance(out0, tuple):   # supports deep supervision
+                if isinstance(out0, tuple):
                     delta0, aux0 = out0
                 else:
                     delta0, aux0 = out0, None
@@ -1623,7 +1756,6 @@ def train(cfg: Config):
                     c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                 )
 
-            # FP32 fence section (mirrors main loop)
             with torch.autocast(device_type="cuda", enabled=False):
                 Y0_pred_tr_clamped = Y0_pred_tr.clamp(0.0, 12.0).float()
                 Y0mm  = transform_to_mm(Y0_pred_tr_clamped, cfg.transform).float()
@@ -1644,7 +1776,6 @@ def train(cfg: Config):
             loss0 = data_loss0 + gl0 + spec0 + mass0 + hp0 + fssl0
             loss0 = loss0 + 0.01 * (delta0 ** 2).mean()
 
-            # (Optional) deep supervision aux losses for step-0
             if cfg.deep_supervision and aux0 is not None:
                 ds_w = (cfg.ds_weights or [0.2, 0.1])
                 aux_losses0 = []
@@ -1656,7 +1787,7 @@ def train(cfg: Config):
                     X0_ds = F.interpolate(X0[:, 0:1], size=(h, w), mode="area")
                     Y0_ds = F.interpolate(Y0,         size=(h, w), mode="area")
                     M0_ds = F.interpolate(M0,         size=(h, w), mode="nearest")
-                    with autocast_cm():
+                    with autocast_cm(epoch):
                         Y0_pred_aux = apply_residual_gate_in_tr_space(
                             X_tr=X0_ds, delta_tr=aux_delta, M=M0_ds,
                             c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
@@ -1667,10 +1798,7 @@ def train(cfg: Config):
                 if aux_losses0:
                     loss0 = loss0 + sum(aux_losses0)
 
-        # Scale the loss for accumulation BEFORE backward
         (loss0 / accum_steps).backward()
-
-        # Only step/zero when we reach the sync boundary
         if is_sync_step0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -1681,7 +1809,6 @@ def train(cfg: Config):
         steps_iter = tqdm(range(1, expected_steps), total=expected_steps, initial=1,
                           desc=f"Epoch {epoch}/{cfg.epochs} [train]") if is_main else range(1, expected_steps)
 
-        # DO NOT zero_grad here unconditionally; only at sync boundaries (see below)
         for step in steps_iter:
             try:
                 X, Y_true, M = next(it_tr)
@@ -1693,7 +1820,6 @@ def train(cfg: Config):
             Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
             M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
 
-            # If you generate degraded X on the fly:
             if (cfg.x_train_paths is None) and (not cfg.degrade_in_dataset):
                 with torch.no_grad():
                     x_mm = transform_to_mm(X[:, 0:1], cfg.transform)
@@ -1702,14 +1828,13 @@ def train(cfg: Config):
                     x_tr = mm_to_transform(x_mm, cfg.transform)
                     X = torch.cat([x_tr, X[:, 1:]], dim=1)
 
-            # Decide whether to all-reduce on this micro-step
             is_sync_step = (((step + 1) % accum_steps) == 0)
             ctx = nullcontext() if is_sync_step or (not ddp_is_initialized()) else model.no_sync()
 
             with ctx:
-                with autocast_cm():
+                with autocast_cm(epoch):
                     out = model(X)
-                    if isinstance(out, tuple):   # supports deep supervision
+                    if isinstance(out, tuple):
                         delta, aux = out
                     else:
                         delta, aux = out, None
@@ -1719,7 +1844,6 @@ def train(cfg: Config):
                         c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                     )
 
-                # FP32 fence section (unchanged)
                 with torch.autocast(device_type="cuda", enabled=False):
                     Y_pred_tr_clamped = Y_pred_tr.clamp(0.0, 12.0).float()
                     Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform).float()
@@ -1729,7 +1853,6 @@ def train(cfg: Config):
                     spec = spectral_loss(Y_pred_tr * M, Y_true * M).float() * cfg.w_spec if cfg.w_spec > 0 \
                            else torch.tensor(0., device=device)
 
-                # Main loss terms (unchanged)
                 if cfg.loss == "huber":
                     data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
                 else:
@@ -1742,7 +1865,6 @@ def train(cfg: Config):
                 loss = data_loss + gl + spec + mass + hp + fssl
                 loss = loss + 0.01 * (delta ** 2).mean()
 
-                # Deep supervision aux heads (if enabled)
                 if cfg.deep_supervision and aux is not None:
                     ds_w = (cfg.ds_weights or [0.2, 0.1])
                     aux_losses = []
@@ -1754,7 +1876,7 @@ def train(cfg: Config):
                         X_ds = F.interpolate(X[:, 0:1],   size=(h, w), mode="area")
                         Y_ds = F.interpolate(Y_true,      size=(h, w), mode="area")
                         M_ds = F.interpolate(M,           size=(h, w), mode="nearest")
-                        with autocast_cm():
+                        with autocast_cm(epoch):
                             Y_pred_aux = apply_residual_gate_in_tr_space(
                                 X_tr=X_ds, delta_tr=aux_delta, M=M_ds,
                                 c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
@@ -1765,10 +1887,8 @@ def train(cfg: Config):
                     if aux_losses:
                         loss = loss + sum(aux_losses)
 
-                # Backward on scaled loss for accumulation
                 (loss / accum_steps).backward()
 
-            # Only all-reduce (implicit) + step at sync boundaries
             if is_sync_step:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
@@ -1779,7 +1899,7 @@ def train(cfg: Config):
                 steps_iter.set_postfix(loss=running / log_every)
                 running = 0.0
 
-        # ---- Flush pending grads if expected_steps not divisible by accum_steps ----
+        # Flush pending grads if steps not divisible by accum_steps
         if (expected_steps % accum_steps) != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -1787,18 +1907,17 @@ def train(cfg: Config):
 
         del it_tr
 
-
-        # --- Pre-validation rendezvous (all ranks) ---
-        # This is the single synchronization point AFTER training steps for the epoch.
-        # Keep it. Do not add more barriers until next epoch.
-        _cuda_sync(); cpu_barrier()
-
-        from itertools import islice
-        import traceback
+        # ---------------------------
+        # Pre-validation rendezvous
+        # ---------------------------
+        _cuda_sync(); barrier()
 
         # ============================
         # VALIDATION (rank 0 only)
         # ============================
+        from itertools import islice
+        import traceback
+
         if is_main and dl_va is not None:
             model.eval()
 
@@ -1810,25 +1929,23 @@ def train(cfg: Config):
 
             print("[val] probing first batch...", flush=True)
             try:
-                it_va_probe = iter(dl_va)               # with num_workers=0, runs in main proc
-                Xp, Yp, Mp = next(it_va_probe)          # if it fails, it's __getitem__/collate
+                it_va_probe = iter(dl_va)
+                Xp, Yp, Mp = next(it_va_probe)
                 print("[val] got first batch", tuple(Xp.shape), flush=True)
                 del it_va_probe, Xp, Yp, Mp
             except Exception as e:
                 print(f"[val] ERROR fetching first batch: {repr(e)}", flush=True)
                 traceback.print_exc()
                 val_failed = 1
-                mean_val = float('inf')                 # fail-safe metric
+                mean_val = float('inf')
             else:
-                # --- Run up to cfg.val_steps only ---
-                with torch.no_grad(), autocast_cm():
+                with torch.no_grad(), autocast_cm(epoch):
                     it_va = iter(dl_va)
                     n_val = int(getattr(cfg, "val_steps", 0) or 0)
-                    print(f"[val] val_steps = {n_val}", flush=True)
                     iterable = islice(it_va, n_val) if n_val > 0 else iter(dl_va)
 
                     for X, Y_true, M in tqdm(iterable, total=(n_val if n_val > 0 else None),
-                                            desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
+                                             desc=f"Epoch {epoch}/{cfg.epochs} [val]"):
                         X = X.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                         Y_true = Y_true.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                         M = M.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -1838,6 +1955,10 @@ def train(cfg: Config):
                             continue
 
                         delta_val = model(X)
+                        if isinstance(delta_val, tuple):
+                            # Align with train path; aux heads are ignored for metrics
+                            delta_val = delta_val[0]
+
                         Y_pred_tr = apply_residual_gate_in_tr_space(
                             X_tr=X[:, 0:1], delta_tr=delta_val, M=M,
                             c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
@@ -1893,18 +2014,20 @@ def train(cfg: Config):
         else:
             mean_val = float('inf')
 
-        # Rank-0 steps scheduler (no barrier), then broadcast LR to all ranks (already in your code)
+        # ---------------------------
+        # LR scheduling & sync
+        # ---------------------------
         if is_main:
             scheduler.step(mean_val)
-        # Sync LR values to other ranks (no barrier needed)
         if ddp_is_initialized():
             for pg in opt.param_groups:
                 lr_t = torch.tensor([pg['lr']], device=device)
                 dist.broadcast(lr_t, src=0)
                 pg['lr'] = float(lr_t.item())
 
-        # ======= DO NOT BARRIER HERE =======
-        # Compute flags on rank-0, broadcast to all ranks (no barrier)
+        # ---------------------------
+        # Early stopping (broadcast flags)
+        # ---------------------------
         if is_main:
             improved_flag_local = int(np.isfinite(mean_val) and (mean_val < best_val - 1e-5))
             planned_best_val_local = float(min(best_val, mean_val))
@@ -1915,22 +2038,22 @@ def train(cfg: Config):
             planned_best_val_local = best_val
             should_stop_flag_local = 0
 
-        # Use your helper to broadcast scalars (keeps existing infra)
         improved_flag    = ddp_broadcast_scalar(improved_flag_local,    device, torch.int32)
         planned_best_val = ddp_broadcast_scalar(planned_best_val_local, device, torch.float32)
         should_stop_flag = ddp_broadcast_scalar(should_stop_flag_local, device, torch.int32)
 
-        # Rank-0 updates trackers and saves checkpoints (NO barrier after)
+        # ---------------------------
+        # Checkpointing (rank-0)
+        # ---------------------------
         if is_main:
             state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
 
-            # Save "last" with full training state (resume)
             torch.save({
                 "model": state_dict,
                 "optimizer": opt.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
-                "best_val": best_val,   # note: updated below on improvement
+                "best_val": best_val,
                 "cfg": asdict(cfg)
             }, ckpt_last)
 
@@ -1938,7 +2061,6 @@ def train(cfg: Config):
                 best_val = float(planned_best_val)
                 best_epoch = epoch
                 patience_ctr = 0
-                # Save "best" with weights-only (inference/warm-start)
                 torch.save({
                     "model": state_dict,
                     "cfg": asdict(cfg),
@@ -1949,8 +2071,6 @@ def train(cfg: Config):
             else:
                 patience_ctr += 1
 
-        # ======= STILL NO BARRIER HERE =======
-        # Early stop / epoch++
         if int(should_stop_flag) == 1:
             if is_main:
                 print(f"Early stopping at epoch {epoch}. Best epoch: {best_epoch} (val={best_val:.6f})", flush=True)
@@ -1959,10 +2079,11 @@ def train(cfg: Config):
             epoch += 1
 
     # Final sync & cleanup
-    _cuda_sync(); cpu_barrier()
+    _cuda_sync(); barrier()
     if is_main:
         print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best), flush=True)
     ddp_cleanup()
+    
 # ---------------------------
 # Inference (single-process by default)
 # ---------------------------

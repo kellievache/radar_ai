@@ -41,8 +41,12 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 #  unet_radar_correction.py \
 #  --biased_crops \
 
-python unet_radar_correction.py \
+#python unet_radar_correction.py \
+
+torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
+  unet_radar_correction.py \
   --mode train \
+  --biased_crops \
   --out_dir /nfs/pancake/u5/projects/vachek/radar_ai/models/ \
   --resume_from /nfs/pancake/u5/projects/vachek/radar_ai/models/best_torch_diff_update.pt \
   --best_name best_torch_diff_update.pt \
@@ -52,14 +56,14 @@ python unet_radar_correction.py \
   --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train_opt.zarr \
   --x_val_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val_opt.zarr \
   --x_var ppt \
-  --steps_per_epoch 3600 \
+  --steps_per_epoch 8 \
   --val_steps 200 \
   --num_levels 4 \
   --ds_weights 0.2 0.1 \
-  --patch 128  \
+  --patch 896  \
   --timeslice_cache 8 \
-  --batch_size 32 \
-  --num_workers 4 \
+  --batch_size 8 \
+  --num_workers 8 \
   --val_num_workers 4 \
   --prefetch_factor 2 \
   --persistent_workers \
