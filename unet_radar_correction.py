@@ -1301,15 +1301,15 @@ def get_center_bbox(H: int, W: int, cfg: Config, *, frac: Optional[float] = None
     x0 = (W - S) // 2
     return (y0, y0 + S, x0, x0 + S)
  
- def center_crop(x: torch.Tensor, bbox: Optional[Tuple[int,int,int,int]]) -> torch.Tensor:
-     """
-     Crop tensor to bbox along last two dims (H,W). If bbox is None, returns x unchanged.
-     Supports shapes [..., H, W].
-     """
-     if bbox is None:
-         return x
-     y0, y1, x0, x1 = bbox
-     return x[..., y0:y1, x0:x1]
+def center_crop(x: torch.Tensor, bbox: Optional[Tuple[int,int,int,int]]) -> torch.Tensor:
+    """
+    Crop tensor to bbox along last two dims (H,W). If bbox is None, returns x unchanged.
+    Supports shapes [..., H, W].
+    """
+    if bbox is None:
+        return x
+    y0, y1, x0, x1 = bbox
+    return x[..., y0:y1, x0:x1]
 
 # ---------------------------
 # Static loading
@@ -1566,16 +1566,32 @@ def train(cfg: Config):
             cfg=cfg, mode="val"
         )
         val_num_workers = int(getattr(cfg, "val_num_workers", 0) or 0)
-        dl_va = DataLoader(
-            ds_va,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=val_num_workers,
-            pin_memory=True,
-            persistent_workers=False,  # must be False when num_workers=0
-            collate_fn=safe_collate,
-            timeout=0
-        )
+
+        if val_num_workers > 0:
+            dl_va = DataLoader(
+                ds_va,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                num_workers=val_num_workers,
+                pin_memory=True,
+                persistent_workers=True,          # ok with spawn
+                multiprocessing_context="spawn",  # <-- IMPORTANT
+                collate_fn=safe_collate,
+                timeout=0,
+                prefetch_factor=2,                # optional, tune if needed
+                worker_init_fn=dataloader_worker_init
+            )
+        else:
+            dl_va = DataLoader(
+                ds_va,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+                persistent_workers=False,
+                collate_fn=safe_collate,
+                timeout=0
+            )
 
     # ---------------------------
     # DataLoader (train)
