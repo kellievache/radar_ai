@@ -331,6 +331,16 @@ class Config:
     w_hp: float = 0.1
     w_fss: float = 0.4
 
+    # ---------- Center-loss controls ----------
+    # If True, compute most losses only on a centered region of each patch.
+    center_loss: bool = True
+    # Choose either a relative fraction (of min(H,W)) or a fixed size in pixels (square).
+    # If both are provided, center_size takes precedence.
+    center_fraction: Optional[float] = 0.2   # e.g., 128/640 ≈ 0.2 (adjust to your tile)
+    center_size: Optional[int] = None        # e.g., 128
+    # Keep mass penalty over the FULL field by default to preserve global water balance.
+    center_apply_mass: bool = False
+ 
     # FSS thresholds (mm/day)
     fss_thresholds: List[float] = None
     fss_window: int = 9
@@ -1264,6 +1274,44 @@ def fss_loss(pred_mm, target_mm, thrs, window, mask):
     return sum(vals) / max(len(vals), 1)
 
 # ---------------------------
+# Center-loss helpers (NEW)
+# ---------------------------
+def get_center_bbox(H: int, W: int, cfg: Config, *, frac: Optional[float] = None,
+                    size_pix: Optional[int] = None) -> Optional[Tuple[int,int,int,int]]:
+    """
+    Returns (y0, y1, x0, x1) for center crop, or None if center_loss is disabled.
+    Priority: size_pix (if provided) > cfg.center_size > frac > cfg.center_fraction.
+    The crop is square, clamped to image size.
+    """
+    if not getattr(cfg, "center_loss", False):
+        return None
+    # resolve size
+    S = None
+    if size_pix is not None:
+        S = int(size_pix)
+    elif getattr(cfg, "center_size", None):
+        S = int(cfg.center_size)
+    else:
+        f = float(frac) if frac is not None else float(getattr(cfg, "center_fraction", 0.0) or 0.0)
+        if f <= 0:
+            return None
+        S = int(round(min(H, W) * f))
+    S = max(1, min(S, H, W))
+    y0 = (H - S) // 2
+    x0 = (W - S) // 2
+    return (y0, y0 + S, x0, x0 + S)
+ 
+ def center_crop(x: torch.Tensor, bbox: Optional[Tuple[int,int,int,int]]) -> torch.Tensor:
+     """
+     Crop tensor to bbox along last two dims (H,W). If bbox is None, returns x unchanged.
+     Supports shapes [..., H, W].
+     """
+     if bbox is None:
+         return x
+     y0, y1, x0, x1 = bbox
+     return x[..., y0:y1, x0:x1]
+
+# ---------------------------
 # Static loading
 # ---------------------------
 def load_arrays(paths: List[str], var: str, time_name: str) -> np.ndarray:
@@ -1770,9 +1818,41 @@ def train(cfg: Config):
             else:
                 data_loss0 = F.l1_loss(Y0_pred_tr * M0, Y0 * M0)
             gl0   = gradient_loss(Y0_pred_tr, Y0, mask=M0) * cfg.w_grad
-            mass0 = mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-            hp0   = F.l1_loss(highpass(Y0_pred_tr, 1.5) * M0, highpass(Y0, 1.5) * M0) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-            fssl0 = fss_loss(Y0mm, T0mm, cfg.fss_thresholds, cfg.fss_window, M0) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+            #mass0 = mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+            #hp0   = F.l1_loss(highpass(Y0_pred_tr, 1.5) * M0, highpass(Y0, 1.5) * M0) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+            #fssl0 = fss_loss(Y0mm, T0mm, cfg.fss_thresholds, cfg.fss_window, M0) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+
+        # ----- Center-loss application (NEW) -----
+        H0, W0 = Y0.shape[-2:]
+        bbox0 = get_center_bbox(H0, W0, cfg)
+        if (bbox0 is not None) and (global_rank == 0):
+            # Log once per epoch on first batch
+            y0c, y1c, x0c, x1c = bbox0
+            print(f"[train] center-loss region: {(y1c-y0c)}x{(x1c-x0c)} within {H0}x{W0}", flush=True)
+        # center crops for transform-space losses
+        Y0_pred_tr_c = center_crop(Y0_pred_tr, bbox0)
+        Y0_c         = center_crop(Y0,         bbox0)
+        M0_c         = center_crop(M0,         bbox0)
+        # center crops for mm losses if needed
+        Y0mm_c = center_crop(Y0mm, bbox0)
+        T0mm_c = center_crop(T0mm, bbox0)
+          # ----- Replace losses with center versions (mass optionally full) -----
+        if cfg.loss == "huber":
+            data_loss0 = F.smooth_l1_loss(Y0_pred_tr_c * M0_c, Y0_c * M0_c)
+        else:
+            data_loss0 = F.l1_loss(Y0_pred_tr_c * M0_c, Y0_c * M0_c)
+        gl0   = gradient_loss(Y0_pred_tr_c, Y0_c, mask=M0_c) * cfg.w_grad
+        mass0 = (
+            mass_preservation_penalty(Y0mm_c, T0mm_c, mask=M0_c) * cfg.w_mass
+            if (cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False))
+            else (mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass if cfg.w_mass > 0 else 0.0)
+        )
+        hp0   = F.l1_loss(highpass(Y0_pred_tr_c, 1.5) * M0_c, highpass(Y0_c, 1.5) * M0_c) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+        # spectral/fss on center
+        with torch.autocast(device_type="cuda", enabled=False):
+            spec0 = spectral_loss(Y0_pred_tr_c * M0_c, Y0_c * M0_c).float() * cfg.w_spec if cfg.w_spec > 0 else torch.tensor(0., device=device)
+            fssl0 = fss_loss(Y0mm_c, T0mm_c, cfg.fss_thresholds, cfg.fss_window, M0_c) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+
             loss0 = data_loss0 + gl0 + spec0 + mass0 + hp0 + fssl0
             loss0 = loss0 + 0.01 * (delta0 ** 2).mean()
 
@@ -1794,7 +1874,11 @@ def train(cfg: Config):
                         )
                         aux_data = F.smooth_l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds) if cfg.loss == "huber" \
                                   else F.l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds)
-                    aux_losses0.append(ds_w[i] * aux_data)
+                    #aux_losses0.append(ds_w[i] * aux_data)
+                    # use centered aux loss
+                    aux_data_c = F.smooth_l1_loss(Y0_pred_aux_c * M0_ds_c, Y0_ds_c * M0_ds_c) if cfg.loss == "huber" \
+                                else F.l1_loss(Y0_pred_aux_c * M0_ds_c, Y0_ds_c * M0_ds_c)
+                    aux_losses0.append(ds_w[i] * aux_data_c)
                 if aux_losses0:
                     loss0 = loss0 + sum(aux_losses0)
 
@@ -1850,18 +1934,44 @@ def train(cfg: Config):
                     Y_true_mm = transform_to_mm(Y_true,            cfg.transform).float()
                     Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
                     Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
-                    spec = spectral_loss(Y_pred_tr * M, Y_true * M).float() * cfg.w_spec if cfg.w_spec > 0 \
+                  #  spec = spectral_loss(Y_pred_tr * M, Y_true * M).float() * cfg.w_spec if cfg.w_spec > 0 \
+                  #         else torch.tensor(0., device=device)
+
+                #if cfg.loss == "huber":
+                #    data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
+                #else:
+                #    data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+                #gl   = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+                #mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+                #hp   = F.l1_loss(highpass(Y_pred_tr, 1.5) * M, highpass(Y_true, 1.5) * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                #fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+                # ----- Center-loss application (NEW) -----
+                Hc, Wc = Y_true.shape[-2:]
+                bbox = get_center_bbox(Hc, Wc, cfg)
+                # center crops (transform)
+                Y_pred_tr_c = center_crop(Y_pred_tr, bbox)
+                Y_true_c    = center_crop(Y_true,    bbox)
+                M_c         = center_crop(M,         bbox)
+                # center crops (mm)
+                Y_pred_mm_c = center_crop(Y_pred_mm, bbox)
+                Y_true_mm_c = center_crop(Y_true_mm, bbox)
+
+                with torch.autocast(device_type="cuda", enabled=False):
+                    spec = spectral_loss(Y_pred_tr_c * M_c, Y_true_c * M_c).float() * cfg.w_spec if cfg.w_spec > 0 \
                            else torch.tensor(0., device=device)
 
                 if cfg.loss == "huber":
-                    data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
+                    data_loss = F.smooth_l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
                 else:
-                    data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
-                gl   = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
-                mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-                hp   = F.l1_loss(highpass(Y_pred_tr, 1.5) * M, highpass(Y_true, 1.5) * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-                fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
-
+                    data_loss = F.l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
+                gl   = gradient_loss(Y_pred_tr_c, Y_true_c, mask=M_c) * cfg.w_grad
+                mass = (
+                    mass_preservation_penalty(Y_pred_mm_c, Y_true_mm_c, mask=M_c) * cfg.w_mass
+                    if (cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False))
+                    else (mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0)
+                )
+                hp   = F.l1_loss(highpass(Y_pred_tr_c, 1.5) * M_c, highpass(Y_true_c, 1.5) * M_c) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                fssl = fss_loss(Y_pred_mm_c, Y_true_mm_c, cfg.fss_thresholds, cfg.fss_window, M_c) * cfg.w_fss if cfg.w_fss > 0 else 0.0
                 loss = data_loss + gl + spec + mass + hp + fssl
                 loss = loss + 0.01 * (delta ** 2).mean()
 
@@ -1883,7 +1993,15 @@ def train(cfg: Config):
                             )
                             aux_data = F.smooth_l1_loss(Y_pred_aux * M_ds, Y_ds * M_ds) if cfg.loss == "huber" \
                                       else F.l1_loss(Y_pred_aux * M_ds, Y_ds * M_ds)
-                        aux_losses.append(ds_w[i] * aux_data)
+                        #aux_losses.append(ds_w[i] * aux_data)
+                        # center at aux scale
+                        bbox_ds = get_center_bbox(h, w, cfg)
+                        Y_pred_aux_c = center_crop(Y_pred_aux, bbox_ds)
+                        Y_ds_c       = center_crop(Y_ds,       bbox_ds)
+                        M_ds_c       = center_crop(M_ds,       bbox_ds)
+                        aux_data = F.smooth_l1_loss(Y_pred_aux_c * M_ds_c, Y_ds_c * M_ds_c) if cfg.loss == "huber" \
+                                   else F.l1_loss(Y_pred_aux_c * M_ds_c, Y_ds_c * M_ds_c)
+                        aux_losses.append(ds_w[i] * aux_data)                        
                     if aux_losses:
                         loss = loss + sum(aux_losses)
 
@@ -1964,12 +2082,12 @@ def train(cfg: Config):
                             c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                         )
 
-                        if cfg.loss == "huber":
-                            data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
-                        else:
-                            data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
-
-                        gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
+                       # if cfg.loss == "huber":
+                       #     data_loss = F.smooth_l1_loss(Y_pred_tr * M, Y_true * M)
+                       # else:
+                       #     data_loss = F.l1_loss(Y_pred_tr * M, Y_true * M)
+#
+#                        gl = gradient_loss(Y_pred_tr, Y_true, mask=M) * cfg.w_grad
 
                         Y_pred_tr_clamped = Y_pred_tr.clamp(min=0.0, max=12.0)
                         Y_pred_mm = transform_to_mm(Y_pred_tr_clamped, cfg.transform)
@@ -1977,12 +2095,40 @@ def train(cfg: Config):
                         Y_pred_mm = torch.nan_to_num(Y_pred_mm, nan=0.0, posinf=0.0, neginf=0.0)
                         Y_true_mm = torch.nan_to_num(Y_true_mm, nan=0.0, posinf=0.0, neginf=0.0)
 
-                        spec = spectral_loss(Y_pred_tr * M, Y_true * M) * cfg.w_spec if cfg.w_spec > 0 else 0.0
-                        mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-                        hp_pred = highpass(Y_pred_tr, sigma=1.5)
-                        hp_true = highpass(Y_true,    sigma=1.5)
-                        hp = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-                        fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+                    #    spec = spectral_loss(Y_pred_tr * M, Y_true * M) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+                    #    mass = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0
+                    #    hp_pred = highpass(Y_pred_tr, sigma=1.5)
+                    #    hp_true = highpass(Y_true,    sigma=1.5)
+                    #    hp = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                    #    fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+                        # ----- Center-loss in validation (NEW) -----
+                        Hval, Wval = Y_true.shape[-2:]
+                        bboxv = get_center_bbox(Hval, Wval, cfg)
+
+                        Y_pred_tr_c = center_crop(Y_pred_tr, bboxv)
+                        Y_true_c    = center_crop(Y_true,    bboxv)
+                        M_c         = center_crop(M,         bboxv)
+
+                        Y_pred_mm_c = center_crop(Y_pred_mm, bboxv)
+                        Y_true_mm_c = center_crop(Y_true_mm, bboxv)
+
+                        if cfg.loss == "huber":
+                            data_loss = F.smooth_l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
+                        else:
+                            data_loss = F.l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
+
+                        gl = gradient_loss(Y_pred_tr_c, Y_true_c, mask=M_c) * cfg.w_grad
+
+                        spec = spectral_loss(Y_pred_tr_c * M_c, Y_true_c * M_c) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+                        mass = (
+                            mass_preservation_penalty(Y_pred_mm_c, Y_true_mm_c, mask=M_c) * cfg.w_mass
+                            if (cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False))
+                            else (mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0)
+                        )
+                        hp_pred = highpass(Y_pred_tr_c, sigma=1.5)
+                        hp_true = highpass(Y_true_c,    sigma=1.5)
+                        hp = F.l1_loss(hp_pred * M_c, hp_true * M_c) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                        fssl = fss_loss(Y_pred_mm_c, Y_true_mm_c, cfg.fss_thresholds, cfg.fss_window, M_c) * cfg.w_fss if cfg.w_fss > 0 else 0.0
 
                         vloss = data_loss + gl + spec + mass + hp + fssl
                         va_losses.append(float(vloss.detach()))
@@ -2374,6 +2520,18 @@ def build_arg_parser():
     ap.add_argument("--biased_crops", action="store_true", default=None, help="N ")
     
     # Policy name as a string; restrict to implemented strategies
+
+    # ---------- Center-loss CLI (NEW) ----------
+    ap.add_argument("--center_loss", action="store_true", help="Enable center-loss (focus losses on center crop).")
+    ap.add_argument("--no_center_loss", action="store_true", help="Disable center-loss.")
+    ap.add_argument("--center_fraction", type=float, default=None,
+                    help="Center crop size as fraction of min(H,W); ignored if center_size is set.")
+    ap.add_argument("--center_size", type=int, default=None,
+                    help="Center crop size in pixels (square). Overrides center_fraction if set.")
+    ap.add_argument("--center_apply_mass", action="store_true",
+                    help="Also apply mass penalty on center crop (default is full field).")
+
+
     ap.add_argument(
         "--biased_policy",
         type=str,
@@ -2442,6 +2600,24 @@ def main():
     if args.val_num_workers is not None: cfg.val_num_workers = args.val_num_workers
     if args.prefetch_factor is not None: cfg.prefetch_factor = args.prefetch_factor
     if args.persistent_workers: cfg.persistent_workers = True
+
+    # ---- Center-loss CLI bindings (NEW) ----
+    if args.center_loss:
+        cfg.center_loss = True
+    if args.no_center_loss:
+        cfg.center_loss = False
+    if args.center_fraction is not None:
+        cfg.center_fraction = args.center_fraction
+    if args.center_size is not None:
+        cfg.center_size = args.center_size
+    if args.center_apply_mass:
+        cfg.center_apply_mass = True
+    # If both provided, prefer size:
+    if (cfg.center_size is not None) and (cfg.center_size <= 0):
+        cfg.center_size = None
+    if (cfg.center_fraction is not None) and (cfg.center_fraction <= 0):
+        cfg.center_fraction = None
+
 
     if args.out_dir: cfg.out_dir = args.out_dir
     if args.ckpt_name: cfg.ckpt_name = args.ckpt_name

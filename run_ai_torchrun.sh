@@ -47,6 +47,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
   unet_radar_correction.py \
   --mode train \
   --biased_crops \
+  --center_loss \
+  --center_size 128 \
   --out_dir /nfs/pancake/u5/projects/vachek/radar_ai/models/ \
   --resume_from /nfs/pancake/u5/projects/vachek/radar_ai/models/best_torch_diff_update.pt \
   --best_name best_torch_diff_update.pt \
@@ -56,7 +58,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
   --x_train_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_train_opt.zarr \
   --x_val_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val_opt.zarr \
   --x_var ppt \
-  --steps_per_epoch 8 \
+  --steps_per_epoch 3600 \
   --val_steps 200 \
   --num_levels 4 \
   --ds_weights 0.2 0.1 \
