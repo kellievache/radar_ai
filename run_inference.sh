@@ -13,11 +13,11 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 python unet_radar_correction.py \
   --mode infer \
-  --ckpt_path /nfs/pancake/u5/projects/vachek/radar_ai/models/last_torch.pt \
+  --ckpt_path /nfs/pancake/u5/projects/vachek/radar_ai/models/best_torch_diff_update.pt \
   --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc \
-  --out_path  /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/ \
-  --domain_mask_npy /a1/unet/prism_domain_mask.npy \
-  --climatology_npy /a1/unet/prism_daily_normals_366.npy
+  --out_path  /nfs/pancake/u4/data/prism/us/an91/r2112_unet1/ehdr/800m/ppt/daily/ \
+  --domain_mask_npy /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/prism_domain_mask.npy \
+  --climatology_npy /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/prism_daily_normals_366.npy
 
 
    
