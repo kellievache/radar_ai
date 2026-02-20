@@ -43,6 +43,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 #python unet_radar_correction.py \
 
+
 torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
   unet_radar_correction.py \
   --mode train \
@@ -59,7 +60,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
   --x_val_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/x_val_opt.zarr \
   --x_var ppt \
   --steps_per_epoch 3600 \
-  --val_steps 200 \
+  --val_steps 300 \
   --num_levels 4 \
   --ds_weights 0.2 0.1 \
   --patch 896  \
@@ -69,13 +70,26 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
   --val_num_workers 4 \
   --prefetch_factor 2 \
   --persistent_workers \
-  --val_steps 300 \
   --biased_policy diff \
   --biased_warmup_epochs 2 \
   --domain_mask_npy /a1/unet/prism_domain_mask.npy \
   --climatology_npy /a1/unet/prism_daily_normals_366.npy \
   --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc \
   --out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/ \
-   
+  \
+  # ---- Guided-window selection (starting defaults) ----
+  --sampling_mode binary \
+  --val_sampling_mode binary \
+  --k_windows 1 \
+  --win_hw 128 128 \
+  --margin 32 \
+  --keepout_center_px 64 \
+  --jitter 8 \
+  --min_score 4.0 \
+  --suppress_radius 64 \
+  --p_guided_start 0.3 \
+  --p_guided_end 0.9 \
+  --ramp_start_step 0 \
+  --ramp_end_step 20000
    
    
