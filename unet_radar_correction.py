@@ -1344,6 +1344,124 @@ def center_crop(x: torch.Tensor, bbox: Optional[Tuple[int,int,int,int]]) -> torc
     y0, y1, x0, x1 = bbox
     return x[..., y0:y1, x0:x1]
 
+ ===========================
+# TensorBoard overlay helpers
+# ===========================
+import torch
+from torchvision.utils import make_grid
+
+def _to_uint8_3ch(img_1ch: torch.Tensor, normalize=True) -> torch.Tensor:
+    """
+    Convert a [1,H,W] float tensor to [3,H,W] uint8 for logging/drawing.
+    - If normalize=True, scales to [0,1] by (x - min)/(max-min) with eps guard.
+    - Clamps to [0,1] then scales to [0,255].
+    """
+    assert img_1ch.ndim == 3 and img_1ch.shape[0] == 1, f"expected [1,H,W], got {tuple(img_1ch.shape)}"
+    x = img_1ch.float()
+    if normalize:
+        x_min = torch.nan_to_num(x.min(), nan=0.0)
+        x_max = torch.nan_to_num(x.max(), nan=1.0)
+        denom = (x_max - x_min).clamp_min(1e-6)
+        x = (x - x_min) / denom
+    x = x.clamp(0, 1)
+    x3 = x.repeat(3, 1, 1)
+    return (x3 * 255.0 + 0.5).byte()
+
+def _simple_colormap01(x01: torch.Tensor) -> torch.Tensor:
+    """
+    Map [1,H,W] in [0,1] to a simple RGB heatmap [3,H,W] (no matplotlib).
+    Uses a 'magma-ish' palette constructed analytically.
+    """
+    assert x01.ndim == 3 and x01.shape[0] == 1
+    x = x01.clamp(0, 1)
+    # Simple piecewise color ramp
+    r = (x ** 0.5)
+    g = (x ** 1.0) * 0.7
+    b = (1.0 - x) ** 2
+    rgb = torch.cat([r, g, b], dim=0)
+    return (rgb.clamp(0, 1) * 255.0 + 0.5).byte()
+
+def _draw_box_rgb_(img_rgb_u8: torch.Tensor, box, color=(255, 0, 0), width=2):
+    """
+    In-place draw of a rectangular border on [3,H,W] uint8 tensor.
+    box=(y0,x0,y1,x1), color=(R,G,B), width=pixels.
+    """
+    assert img_rgb_u8.ndim == 3 and img_rgb_u8.shape[0] == 3, "need [3,H,W] uint8 image"
+    H, W = img_rgb_u8.shape[-2], img_rgb_u8.shape[-1]
+    y0, x0, y1, x1 = [int(v) for v in box]
+    y0 = max(0, min(y0, H - 1)); y1 = max(0, min(y1, H));  # y1 is exclusive in slices below
+    x0 = max(0, min(x0, W - 1)); x1 = max(0, min(x1, W));
+    # top/bottom
+    img_rgb_u8[:, y0:y0+width, x0:x1] = torch.tensor(color, dtype=img_rgb_u8.dtype, device=img_rgb_u8.device).view(3,1,1)
+    img_rgb_u8[:, max(y1-width,0):y1, x0:x1] = torch.tensor(color, dtype=img_rgb_u8.dtype, device=img_rgb_u8.device).view(3,1,1)
+    # left/right
+    img_rgb_u8[:, y0:y1, x0:x0+width] = torch.tensor(color, dtype=img_rgb_u8.dtype, device=img_rgb_u8.device).view(3,1,1)
+    img_rgb_u8[:, y0:y1, max(x1-width,0):x1] = torch.tensor(color, dtype=img_rgb_u8.dtype, device=img_rgb_u8.device).view(3,1,1)
+
+def _overlay_boxes_on_1ch(img_1ch: torch.Tensor, boxes, color=(255,0,0), width=2, normalize=True) -> torch.Tensor:
+    """
+    Returns a [3,H,W] uint8 image of img_1ch with colored rectangle overlays.
+    - img_1ch: [1,H,W] float
+    - boxes: list[(y0,x0,y1,x1)]
+    """
+    rgb = _to_uint8_3ch(img_1ch, normalize=normalize).clone()
+    for box in boxes:
+        _draw_box_rgb_(rgb, box, color=color, width=width)
+    return rgb
+
+def log_guided_window_debug(
+    writer,
+    tag_prefix: str,
+    Y_true: torch.Tensor,          # [B,1,H,W] (transform space)
+    Y_pred: torch.Tensor,          # [B,1,H,W] (transform space)
+    interest: torch.Tensor,        # [B,1,H,W] score map used for selection
+    boxes_k: list,                 # list of length B; each item list of boxes
+    global_step: int,
+    *,
+    log_batch_idx: int = 0,
+    to_mm_transform: str = None,   # pass cfg.transform if you want mm versions too
+    device=None
+):
+    """
+    Logs a 2xN grid to TensorBoard:
+      Row 1: Y_true (with red boxes) | Y_pred (with yellow boxes)
+      Row 2: |Y_pred - Y_true| (cyan boxes) | interest heatmap (magenta boxes)
+    Only logs sample 'log_batch_idx' from the mini-batch to keep it light.
+    """
+    if writer is None:
+        return
+    b = int(log_batch_idx)
+    if b >= Y_true.shape[0]:
+        b = 0
+
+    with torch.no_grad():
+        y_t = Y_true[b:b+1]  # [1,1,H,W]
+        y_p = Y_pred[b:b+1]
+        intr = interest[b:b+1]
+        boxes = boxes_k[b] if isinstance(boxes_k, (list, tuple)) and len(boxes_k) > b else []
+
+        # build |pred - true| in transform space
+        err = (y_p - y_t).abs()
+
+        # Normalize to uint8 RGB and draw boxes in different colors
+        img_true  = _overlay_boxes_on_1ch(y_t[0],  boxes, color=(255, 64, 64),  width=2, normalize=True)
+        img_pred  = _overlay_boxes_on_1ch(y_p[0],  boxes, color=(255, 255, 64), width=2, normalize=True)
+        img_err   = _overlay_boxes_on_1ch(err[0],  boxes, color=(64, 255, 255), width=2, normalize=True)
+
+        # interest heatmap colorized + boxes
+        intr01 = (intr / (intr.max().clamp_min(1e-6))).clamp(0, 1)
+        img_intr = _simple_colormap01(intr01[0]).clone()
+        for box in boxes:
+            _draw_box_rgb_(img_intr, box, color=(255, 0, 255), width=2)
+
+        # Make a grid: 2 rows x 2 cols
+        grid = make_grid(
+            torch.stack([img_true, img_pred, img_err, img_intr], dim=0).float() / 255.0,
+            nrow=2
+        )
+
+        writer.add_image(f"{tag_prefix}/grid", grid, global_step)
+
 
 # ===========================
 # Guided selection utilities (NEW / GUIDED)
@@ -1602,7 +1720,7 @@ def write_bil_pair(arr2d: np.ndarray, bil_path: str, hdr_path: str,
 #    return default_collate(batch)
 
 
-
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data._utils.collate import default_collate
 
 def safe_collate(batch):
@@ -1684,6 +1802,15 @@ def train(cfg: Config):
     # ---------------------------
     set_seed(cfg.seed)
     ensure_dir(cfg.out_dir)
+
+
+    tb_dir = os.path.join(cfg.out_dir, "tb")
+    if is_main:
+        writer = SummaryWriter(tb_dir)
+    else:
+        writer = None
+
+
     with open(os.path.join(cfg.out_dir, "config.json"), "w") as f:
         json.dump(asdict(cfg), f, indent=2)
 
@@ -2045,6 +2172,24 @@ def train(cfg: Config):
                 boxes_k0[b], cfg, device
             )
             per_sample_losses.append(lb)
+
+
+        if is_main and (global_step % 200 == 0):
+            log_guided_window_debug(
+                writer,
+                tag_prefix="debug/train_step0",
+                Y_true=Y0,
+                Y_pred=Y0_pred_tr,
+                interest=(interest0 if use_guided else torch.zeros_like(Y0)),
+                boxes_k=boxes_k0,
+                global_step=global_step,
+                log_batch_idx=0,
+                to_mm_transform=cfg.transform
+            )
+
+
+
+
         with torch.autocast(device_type="cuda", enabled=False):
             loss0 = torch.stack(per_sample_losses).mean()
             # full-field mass (if not applied per-window)
@@ -2100,6 +2245,20 @@ def train(cfg: Config):
                           desc=f"Epoch {epoch}/{cfg.epochs} [train]") if is_main else range(1, expected_steps)
 
         for step in steps_iter:
+
+
+            if is_main and (global_step % 50 == 0):
+                writer.add_scalar("loss/total", float(loss.detach()), global_step)
+                writer.add_scalar("loss/data", float(data_loss.detach()), global_step)
+                writer.add_scalar("loss/grad", float(gl.detach()), global_step)
+                writer.add_scalar("loss/spectral", float(spec.detach()), global_step)
+                writer.add_scalar("loss/mass", float(mass.detach()), global_step)
+                writer.add_scalar("loss/fss", float(fssl.detach()), global_step)
+                writer.add_scalar("schedule/p_guided", p_guided, global_step)
+
+
+
+
             try:
                 X, Y_true, M = next(it_tr)
             except StopIteration:
@@ -2199,6 +2358,11 @@ def train(cfg: Config):
                     y0c, x0c = (Hc - h_win)//2, (Wc - w_win)//2
                     boxes_k = [[(y0c, x0c, y0c + h_win, x0c + w_win)] for _ in range(Bb)]
 
+
+
+
+
+
                 per_sample = []
                 for b in range(Y_true.shape[0]):
                     lb = compute_all_losses_over_boxes(
@@ -2207,6 +2371,34 @@ def train(cfg: Config):
                         boxes_k[b], cfg, device
                     )
                     per_sample.append(lb)
+
+
+                # if is_main and (global_step % 200 == 0):
+                #     # visualize interest map + picked windows
+                #     import torchvision.utils as vutils
+
+                #     # interest map is (B,1,H,W)
+                #     img_interest = (interest[0:1] / (interest.max()+1e-6))
+                #     writer.add_image("debug/interest_map", img_interest[0], global_step)
+
+                #     # overlay boxes on Y_true and log
+                #     # (I’ll provide a helper below if you'd like)
+
+                if is_main and (global_step % 200 == 0):
+                    log_guided_window_debug(
+                        writer,
+                        tag_prefix="debug/train_step0",
+                        Y_true=Y0,
+                        Y_pred=Y0_pred_tr,
+                        interest=(interest0 if use_guided else torch.zeros_like(Y0)),
+                        boxes_k=boxes_k0,
+                        global_step=global_step,
+                        log_batch_idx=0,
+                        to_mm_transform=cfg.transform
+                    )
+
+
+
                 loss = torch.stack(per_sample).mean()
                 # add full-field mass if not using box mass
                 if cfg.w_mass > 0 and not getattr(cfg, "center_apply_mass", False):
@@ -2404,6 +2596,24 @@ def train(cfg: Config):
                             fss_scores[thr].append(
                                 fss(Y_pred_mm, Y_true_mm, thr=thr, window=cfg.fss_window, mask=M).item()
                             )
+
+
+
+                        if (global_step % 1000 == 0):  # log less often in val
+                            log_guided_window_debug(
+                                writer,
+                                tag_prefix="debug/val",
+                                Y_true=Y_true,
+                                Y_pred=Y_pred_tr,
+                                interest=interest_v,
+                                boxes_k=boxes_k_v,
+                                global_step=global_step,
+                                log_batch_idx=0,
+                                to_mm_transform=cfg.transform
+                            )
+
+
+
 
                 if not val_failed:
                     if len(va_losses) == 0:

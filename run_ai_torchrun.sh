@@ -76,8 +76,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port=29561 \
   --climatology_npy /a1/unet/prism_daily_normals_366.npy \
   --pre_paths /nfs/pancake/u5/projects/vachek/radar_ai/netcdf/infer.nc \
   --out_path /nfs/pancake/u4/data/prism/us/an91/r2112_unet/ehdr/800m/ppt/daily/ \
-  \
-  # ---- Guided-window selection (starting defaults) ----
   --sampling_mode binary \
   --val_sampling_mode binary \
   --k_windows 1 \
