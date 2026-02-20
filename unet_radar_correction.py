@@ -2046,6 +2046,11 @@ def train(cfg: Config):
     # (GUIDED) global step for curriculum
     global_step = (epoch - 1) * max(1, int(getattr(cfg, "steps_per_epoch", 0) or  ds_tr.N // max(1, (int(cfg.batch_size) * (world_size if ddp_is_initialized() else 1)))))
 
+    
+    # (GUIDED/TB) global step for curriculum and logging
+    global_step = (epoch - 1) * expected_steps
+
+
     # quick test inside train(), before your real loop
     # This just generates random inputs rather than finding them on a disk.  So it removes the disk as a b
    # B, C, H, W = cfg.batch_size, in_ch, 128, 128  # adjust in_ch as built
@@ -2193,8 +2198,16 @@ def train(cfg: Config):
         with torch.autocast(device_type="cuda", enabled=False):
             loss0 = torch.stack(per_sample_losses).mean()
             # full-field mass (if not applied per-window)
+            #if cfg.w_mass > 0 and not getattr(cfg, "center_apply_mass", False):
+            #    loss0 = loss0 + mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass
+
+
+            # full-field mass (if not applied per-window)
+            mass_term0 = torch.tensor(0.0, device=device)
             if cfg.w_mass > 0 and not getattr(cfg, "center_apply_mass", False):
-                loss0 = loss0 + mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass
+                mass_term0 = mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass
+                loss0 = loss0 + mass_term0
+
             loss0 = loss0 + 0.01 * (delta0 ** 2).mean()
 
             if cfg.deep_supervision and aux0 is not None:
@@ -2245,19 +2258,6 @@ def train(cfg: Config):
                           desc=f"Epoch {epoch}/{cfg.epochs} [train]") if is_main else range(1, expected_steps)
 
         for step in steps_iter:
-
-
-            if is_main and (global_step % 50 == 0):
-                writer.add_scalar("loss/total", float(loss.detach()), global_step)
-                writer.add_scalar("loss/data", float(data_loss.detach()), global_step)
-                writer.add_scalar("loss/grad", float(gl.detach()), global_step)
-                writer.add_scalar("loss/spectral", float(spec.detach()), global_step)
-                writer.add_scalar("loss/mass", float(mass.detach()), global_step)
-                writer.add_scalar("loss/fss", float(fssl.detach()), global_step)
-                writer.add_scalar("schedule/p_guided", p_guided, global_step)
-
-
-
 
             try:
                 X, Y_true, M = next(it_tr)
@@ -2384,14 +2384,15 @@ def train(cfg: Config):
                 #     # overlay boxes on Y_true and log
                 #     # (I’ll provide a helper below if you'd like)
 
-                if is_main and (global_step % 200 == 0):
+
+                if is_main and (global_step % 200 == 0) and (writer is not None):
                     log_guided_window_debug(
                         writer,
-                        tag_prefix="debug/train_step0",
-                        Y_true=Y0,
-                        Y_pred=Y0_pred_tr,
-                        interest=(interest0 if use_guided else torch.zeros_like(Y0)),
-                        boxes_k=boxes_k0,
+                        tag_prefix="debug/train",
+                        Y_true=Y_true,
+                        Y_pred=Y_pred_tr,
+                        interest=(interest if use_guided else torch.zeros_like(Y_true)),
+                        boxes_k=boxes_k,
                         global_step=global_step,
                         log_batch_idx=0,
                         to_mm_transform=cfg.transform
@@ -2401,9 +2402,26 @@ def train(cfg: Config):
 
                 loss = torch.stack(per_sample).mean()
                 # add full-field mass if not using box mass
+            #    if cfg.w_mass > 0 and not getattr(cfg, "center_apply_mass", False):
+            #        loss = loss + mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass
+
+
+
+                mass_term = torch.tensor(0.0, device=device)
                 if cfg.w_mass > 0 and not getattr(cfg, "center_apply_mass", False):
-                    loss = loss + mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass
-                loss = loss + 0.01 * (delta ** 2).mean()
+                    mass_term = mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass
+                    loss = loss + mass_term
+                    loss = loss + 0.01 * (delta ** 2).mean()
+
+                # ---- (TB) Scalars for this step ----
+                if is_main and (global_step % 50 == 0) and (writer is not None):
+                    writer.add_scalar("loss/total", float(loss.detach()), global_step)
+                    writer.add_scalar("schedule/p_guided", float(p_guided), global_step)
+                    if cfg.w_mass > 0 and not getattr(cfg, "center_apply_mass", False):
+                        writer.add_scalar("loss/mass_term", float(mass_term.detach()), global_step)
+
+
+#                loss = loss + 0.01 * (delta ** 2).mean()
 
 
                 if cfg.deep_supervision and aux is not None:
@@ -2704,6 +2722,13 @@ def train(cfg: Config):
     _cuda_sync(); barrier()
     if is_main:
         print("Training complete. Best checkpoint at:", os.path.abspath(ckpt_best), flush=True)
+
+
+        try:
+            writer.close()
+        except Exception:
+            pass
+
     ddp_cleanup()
     
 # ---------------------------
