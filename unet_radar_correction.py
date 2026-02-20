@@ -409,6 +409,39 @@ class Config:
         if self.ds_weights is None:
             self.ds_weights = [0.2, 0.1]  # sensible default (two aux 
 
+
+    # ---------- Guided window selection (NEW / GUIDED) ----------
+    # window size (h, w)
+    win_hw: Tuple[int, int] = (128, 128)
+    # how to score "interesting" pixels: "binary" | "continuous" | "error"
+    sampling_mode: str = "binary"
+    # validation mode (can be "binary" to keep deterministic behavior)
+    val_sampling_mode: str = "binary"
+    # number of windows per patch
+    k_windows: int = 1
+    # spatial constraints & randomness
+    margin: int = 32
+    keepout_center_px: int = 64
+    jitter: int = 8
+    topk: int = 8
+    min_score: float = 4.0
+    suppress_radius: int = 64
+    # thresholds in mm (used by binary/continuous modes)
+    y_thr_mm: float = 0.1
+    x_thr_mm: float = 0.1
+    d_thr_mm: float = 0.25
+    # error-guided extras
+    err_p: float = 1.0      # 1 ≈ L1, 2 ≈ L2
+    err_w: float = 1.0
+    err_pos: float = 0.25   # slight push to nonzero-precip areas
+    # curriculum: ramp p_guided over global steps
+    p_guided_start: float = 0.3
+    p_guided_end: float   = 0.9
+    ramp_start_step: int = 0
+    ramp_end_step: int   = 20000
+
+
+
 # ---------------------------
 # Degradation ops
 # ---------------------------
@@ -1311,6 +1344,156 @@ def center_crop(x: torch.Tensor, bbox: Optional[Tuple[int,int,int,int]]) -> torc
     y0, y1, x0, x1 = bbox
     return x[..., y0:y1, x0:x1]
 
+
+# ===========================
+# Guided selection utilities (NEW / GUIDED)
+# ===========================
+@torch.no_grad()
+def interest_map_binary_mm(X_coarse_mm, Y_true_mm, y_thr=0.1, x_thr=0.1, d_thr=0.1, dilate=15):
+    """Binary interest where both X and Y exceed thresholds and |Y-X| > d_thr (mm). Returns (B,1,H,W)."""
+    ypos = (Y_true_mm > y_thr)
+    xpos = (X_coarse_mm > x_thr)
+    diff = (Y_true_mm - X_coarse_mm).abs() > d_thr
+    mask = (ypos & xpos & diff).float()
+    if dilate and dilate > 0:
+        pad = int(dilate); k = 2*pad + 1
+        mask = F.max_pool2d(mask, kernel_size=k, stride=1, padding=pad)
+    return mask
+
+@torch.no_grad()
+def interest_map_continuous_mm(X_coarse_mm, Y_true_mm, y_thr=0.1, x_thr=0.1, w_diff=2.0, w_y=1.0, w_x=0.5):
+    """Continuous interest: w_diff*|Y-X| + w_y*ReLU(Y-y_thr) + w_x*ReLU(X-x_thr) (mm)."""
+    pos_y = torch.relu(Y_true_mm - y_thr)
+    pos_x = torch.relu(X_coarse_mm - x_thr)
+    diff  = (Y_true_mm - X_coarse_mm).abs()
+    return w_diff*diff + w_y*pos_y + w_x*pos_x
+
+@torch.no_grad()
+def interest_map_error(pred_tr, Y_true_tr, y_thr_mm=0.1, w_err=1.0, w_pos=0.25, p=1.0, transform=None):
+    """Error-guided interest in transform space plus weak mm bias to nonzero precip."""
+    err = (pred_tr - Y_true_tr).abs()
+    if p != 1.0: err = err**p
+    Y_true_mm = transform_to_mm(Y_true_tr, transform) if transform is not None else Y_true_tr
+    pos = torch.relu(Y_true_mm - y_thr_mm)
+    return w_err * err + w_pos * pos
+
+@torch.no_grad()
+def window_sum_scores(interest, win_hw=(128,128), margin=0, keepout_center_px=0):
+    """Sum scores inside each h×w window using avg_pool2d; returns (scores, valid_mask) both (B,1,Hs,Ws)."""
+    B, C, H, W = interest.shape
+    h, w = win_hw
+    assert C == 1, "Interest must be single-channel"
+    scores = F.avg_pool2d(interest, kernel_size=(h,w), stride=1, padding=0) * (h*w)
+    Hs, Ws = scores.shape[-2:]
+    device = interest.device
+    valid_mask = torch.ones((B,1,Hs,Ws), device=device, dtype=scores.dtype)
+    if margin > 0:
+        y0_min, x0_min = margin, margin
+        y0_max, x0_max = (H - h) - margin, (W - w) - margin
+        yy = torch.arange(Hs, device=device).view(1,1,Hs,1)
+        xx = torch.arange(Ws, device=device).view(1,1,1,Ws)
+        cond = (yy >= y0_min) & (yy <= y0_max) & (xx >= x0_min) & (xx <= x0_max)
+        valid_mask = valid_mask * cond.float()
+    if keepout_center_px and keepout_center_px > 0:
+        yy = torch.arange(Hs, device=device).view(1,1,Hs,1) + h//2
+        xx = torch.arange(Ws, device=device).view(1,1,1,Ws) + w//2
+        cy, cx = H//2, W//2
+        dist2 = (yy - cy).float()**2 + (xx - cx).float()**2
+        valid_mask = valid_mask * (dist2 > (keepout_center_px**2)).float()
+    return scores * valid_mask, valid_mask
+
+@torch.no_grad()
+def select_k_windows(interest, win_hw=(128,128), K=1, margin=16, keepout_center_px=64,
+                     jitter=8, min_score=1.0, suppress_radius=64):
+    """Select up to K diverse windows per sample with NMS-like suppression in center space."""
+    scores, valid_mask = window_sum_scores(interest, win_hw=win_hw, margin=margin, keepout_center_px=keepout_center_px)
+    B, _, Hs, Ws = scores.shape
+    h, w = win_hw
+    H, W = interest.shape[-2:]
+    yy = torch.arange(Hs, device=interest.device).view(1,1,Hs,1) + h//2
+    xx = torch.arange(Ws, device=interest.device).view(1,1,1,Ws) + w//2
+    out = []
+    for b in range(B):
+        s = (scores[b:b+1] * valid_mask[b:b+1]).clone()
+        picks = []
+        for _ in range(K):
+            flat = s.view(-1)
+            mv, mi = flat.max(dim=0)
+            if (mv.item() < min_score) or (mv.item() == 0.0): break
+            iy, ix = divmod(int(mi.item()), Ws)
+            y0, x0 = int(iy), int(ix)
+            if jitter and jitter > 0:
+                jy = int(torch.randint(-jitter, jitter+1, (1,), device=interest.device).item())
+                jx = int(torch.randint(-jitter, jitter+1, (1,), device=interest.device).item())
+                y0 = max(0, min(y0 + jy, H - h)); x0 = max(0, min(x0 + jx, W - w))
+            picks.append((y0, x0, y0 + h, x0 + w))
+            cy, cx = y0 + h//2, x0 + w//2
+            dist2 = (yy - cy).float()**2 + (xx - cx).float()**2
+            s = s * (dist2 > (suppress_radius**2)).float()
+        if not picks:
+            y0c, x0c = (H - h)//2, (W - w)//2
+            picks = [(y0c, x0c, y0c + h, x0c + w)]
+        out.append(picks)
+    return out
+
+def schedule_linear(step, start, end, v0, v1):
+    if step <= start: return v0
+    if step >= end:   return v1
+    t = (step - start) / max(1, (end - start))
+    return (1 - t)*v0 + t*v1
+
+@torch.no_grad()
+def build_interest_mm(X, Y_true, Y_pred_tr, cfg: Config):
+    """Build interest map according to cfg.sampling_mode using mm or error."""
+    X_coarse_mm = transform_to_mm(X[:, 0:1], cfg.transform)
+    Y_true_mm   = transform_to_mm(Y_true,    cfg.transform)
+    mode = getattr(cfg, "sampling_mode", "binary")
+    if mode == "binary":
+        return interest_map_binary_mm(X_coarse_mm, Y_true_mm,
+                                      y_thr=float(cfg.y_thr_mm), x_thr=float(cfg.x_thr_mm), d_thr=float(cfg.d_thr_mm),
+                                      dilate=15)
+    if mode == "continuous":
+        return interest_map_continuous_mm(X_coarse_mm, Y_true_mm,
+                                          y_thr=float(cfg.y_thr_mm), x_thr=float(cfg.x_thr_mm),
+                                          w_diff=float(cfg.w_diff), w_y=float(cfg.w_y), w_x=float(cfg.w_x))
+    if mode == "error":
+        return interest_map_error(Y_pred_tr, Y_true, y_thr_mm=float(cfg.y_thr_mm),
+                                  w_err=float(cfg.err_w), w_pos=float(cfg.err_pos), p=float(cfg.err_p),
+                                  transform=cfg.transform)
+    raise ValueError(f"Unknown sampling_mode: {mode}")
+
+def crop_box_nchw(t, box):
+    y0, x0, y1, x1 = box
+    return t[..., y0:y1, x0:x1]
+
+def compute_all_losses_over_boxes(Y_pred_tr, Y_true, M, Y_pred_mm, Y_true_mm, boxes, cfg: Config, device):
+    """Aggregate your loss terms over a list of boxes; returns scalar tensor."""
+    terms = []
+    for box in boxes:
+        Yp_tr_c = crop_box_nchw(Y_pred_tr, box); Yt_tr_c = crop_box_nchw(Y_true, box); M_c = crop_box_nchw(M, box)
+        Yp_mm_c = crop_box_nchw(Y_pred_mm, box); Yt_mm_c = crop_box_nchw(Y_true_mm, box)
+        # data
+        if cfg.loss == "huber":
+            data = F.smooth_l1_loss(Yp_tr_c * M_c, Yt_tr_c * M_c)
+        else:
+            data = F.l1_loss(Yp_tr_c * M_c, Yt_tr_c * M_c)
+        # gradient
+        gl = gradient_loss(Yp_tr_c, Yt_tr_c, mask=M_c) * cfg.w_grad
+        # spectral / fss (float32)
+        with torch.autocast(device_type="cuda", enabled=False):
+            spec = spectral_loss(Yp_tr_c * M_c, Yt_tr_c * M_c).float() * cfg.w_spec if cfg.w_spec > 0 else torch.tensor(0., device=device)
+            fssl = fss_loss(Yp_mm_c, Yt_mm_c, cfg.fss_thresholds, cfg.fss_window, M_c).float() * cfg.w_fss if cfg.w_fss > 0 else torch.tensor(0., device=device)
+        # mass: per-box only if explicitly requested; otherwise handled at full-field by caller
+        if cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False):
+            mass = mass_preservation_penalty(Yp_mm_c, Yt_mm_c, mask=M_c) * cfg.w_mass
+        else:
+            mass = torch.tensor(0., device=device)
+        # highpass
+        hp = F.l1_loss(highpass(Yp_tr_c, 1.5) * M_c, highpass(Yt_tr_c, 1.5) * M_c) * cfg.w_hp if cfg.w_hp > 0 else torch.tensor(0., device=device)
+        terms.append(data + gl + spec + mass + hp + fssl)
+    return torch.stack(terms).mean()
+
+
 # ---------------------------
 # Static loading
 # ---------------------------
@@ -1733,6 +1916,9 @@ def train(cfg: Config):
     stop_training = False
 
 
+    # (GUIDED) global step for curriculum
+    global_step = (epoch - 1) * max(1, int(getattr(cfg, "steps_per_epoch", 0) or  ds_tr.N // max(1, (int(cfg.batch_size) * (world_size if ddp_is_initialized() else 1)))))
+
     # quick test inside train(), before your real loop
     # This just generates random inputs rather than finding them on a disk.  So it removes the disk as a b
    # B, C, H, W = cfg.batch_size, in_ch, 128, 128  # adjust in_ch as built
@@ -1834,42 +2020,36 @@ def train(cfg: Config):
             else:
                 data_loss0 = F.l1_loss(Y0_pred_tr * M0, Y0 * M0)
             gl0   = gradient_loss(Y0_pred_tr, Y0, mask=M0) * cfg.w_grad
-            #mass0 = mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass if cfg.w_mass > 0 else 0.0
-            #hp0   = F.l1_loss(highpass(Y0_pred_tr, 1.5) * M0, highpass(Y0, 1.5) * M0) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-            #fssl0 = fss_loss(Y0mm, T0mm, cfg.fss_thresholds, cfg.fss_window, M0) * cfg.w_fss if cfg.w_fss > 0 else 0.0
 
-        # ----- Center-loss application (NEW) -----
-        H0, W0 = Y0.shape[-2:]
-        bbox0 = get_center_bbox(H0, W0, cfg)
-        if (bbox0 is not None) and (global_rank == 0):
-            # Log once per epoch on first batch
-            y0c, y1c, x0c, x1c = bbox0
-            print(f"[train] center-loss region: {(y1c-y0c)}x{(x1c-x0c)} within {H0}x{W0}", flush=True)
-        # center crops for transform-space losses
-        Y0_pred_tr_c = center_crop(Y0_pred_tr, bbox0)
-        Y0_c         = center_crop(Y0,         bbox0)
-        M0_c         = center_crop(M0,         bbox0)
-        # center crops for mm losses if needed
-        Y0mm_c = center_crop(Y0mm, bbox0)
-        T0mm_c = center_crop(T0mm, bbox0)
-          # ----- Replace losses with center versions (mass optionally full) -----
-        if cfg.loss == "huber":
-            data_loss0 = F.smooth_l1_loss(Y0_pred_tr_c * M0_c, Y0_c * M0_c)
+        # ----- Guided-window loss (replaces center)  (NEW / GUIDED) -----
+        # curriculum p_guided
+        p_guided = schedule_linear(global_step, cfg.ramp_start_step, cfg.ramp_end_step,
+                                   float(cfg.p_guided_start), float(cfg.p_guided_end))
+        h_win, w_win = cfg.win_hw
+        use_guided = (torch.rand(1, device=device).item() < p_guided)
+        if use_guided:
+            interest0 = build_interest_mm(X0, Y0, Y0_pred_tr, cfg)   # (B,1,H,W)
+            boxes_k0  = select_k_windows(interest0, win_hw=cfg.win_hw, K=int(cfg.k_windows),
+                                         margin=int(cfg.margin), keepout_center_px=int(cfg.keepout_center_px),
+                                         jitter=int(cfg.jitter), min_score=float(cfg.min_score),
+                                         suppress_radius=int(cfg.suppress_radius))
         else:
-            data_loss0 = F.l1_loss(Y0_pred_tr_c * M0_c, Y0_c * M0_c)
-        gl0   = gradient_loss(Y0_pred_tr_c, Y0_c, mask=M0_c) * cfg.w_grad
-        mass0 = (
-            mass_preservation_penalty(Y0mm_c, T0mm_c, mask=M0_c) * cfg.w_mass
-            if (cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False))
-            else (mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass if cfg.w_mass > 0 else 0.0)
-        )
-        hp0   = F.l1_loss(highpass(Y0_pred_tr_c, 1.5) * M0_c, highpass(Y0_c, 1.5) * M0_c) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-        # spectral/fss on center
+            B0, _, H0, W0 = Y0.shape
+            y0c, x0c = (H0 - h_win)//2, (W0 - w_win)//2
+            boxes_k0 = [[(y0c, x0c, y0c + h_win, x0c + w_win)] for _ in range(B0)]
+        per_sample_losses = []
+        for b in range(Y0.shape[0]):
+            lb = compute_all_losses_over_boxes(
+                Y0_pred_tr[b:b+1], Y0[b:b+1], M0[b:b+1],
+                Y0mm[b:b+1],       T0mm[b:b+1],
+                boxes_k0[b], cfg, device
+            )
+            per_sample_losses.append(lb)
         with torch.autocast(device_type="cuda", enabled=False):
-            spec0 = spectral_loss(Y0_pred_tr_c * M0_c, Y0_c * M0_c).float() * cfg.w_spec if cfg.w_spec > 0 else torch.tensor(0., device=device)
-            fssl0 = fss_loss(Y0mm_c, T0mm_c, cfg.fss_thresholds, cfg.fss_window, M0_c) * cfg.w_fss if cfg.w_fss > 0 else 0.0
-
-            loss0 = data_loss0 + gl0 + spec0 + mass0 + hp0 + fssl0
+            loss0 = torch.stack(per_sample_losses).mean()
+            # full-field mass (if not applied per-window)
+            if cfg.w_mass > 0 and not getattr(cfg, "center_apply_mass", False):
+                loss0 = loss0 + mass_preservation_penalty(Y0mm, T0mm, mask=M0) * cfg.w_mass
             loss0 = loss0 + 0.01 * (delta0 ** 2).mean()
 
             if cfg.deep_supervision and aux0 is not None:
@@ -1888,13 +2068,23 @@ def train(cfg: Config):
                             X_tr=X0_ds, delta_tr=aux_delta, M=M0_ds,
                             c=cfg.gate_c, beta=cfg.gate_beta, alpha_bg=cfg.gate_alpha_bg
                         )
-                        aux_data = F.smooth_l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds) if cfg.loss == "huber" \
-                                  else F.l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds)
+                #        aux_data = F.smooth_l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds) if cfg.loss == "huber" \
+                #                  else F.l1_loss(Y0_pred_aux * M0_ds, Y0_ds * M0_ds)
                     #aux_losses0.append(ds_w[i] * aux_data)
                     # use centered aux loss
-                    aux_data_c = F.smooth_l1_loss(Y0_pred_aux_c * M0_ds_c, Y0_ds_c * M0_ds_c) if cfg.loss == "huber" \
-                                else F.l1_loss(Y0_pred_aux_c * M0_ds_c, Y0_ds_c * M0_ds_c)
+                #    aux_data_c = F.smooth_l1_loss(Y0_pred_aux_c * M0_ds_c, Y0_ds_c * M0_ds_c) if cfg.loss == "huber" \
+                #                else F.l1_loss(Y0_pred_aux_c * M0_ds_c, Y0_ds_c * M0_ds_c)
+                #    aux_losses0.append(ds_w[i] * aux_data_c)
+
+                        # (BUGFIX) actually compute centered aux crops before loss
+                        bbox_ds = get_center_bbox(h, w, cfg)
+                        Y0_pred_aux_c = center_crop(Y0_pred_aux, bbox_ds)
+                        Y0_ds_c       = center_crop(Y0_ds,       bbox_ds)
+                        M0_ds_c       = center_crop(M0_ds,       bbox_ds)
+                        aux_data_c = F.smooth_l1_loss(Y0_pred_aux_c * M0_ds_c, Y0_ds_c * M0_ds_c) if cfg.loss == "huber" \
+                                     else F.l1_loss(Y0_pred_aux_c * M0_ds_c, Y0_ds_c * M0_ds_c)
                     aux_losses0.append(ds_w[i] * aux_data_c)
+
                 if aux_losses0:
                     loss0 = loss0 + sum(aux_losses0)
 
@@ -1962,34 +2152,67 @@ def train(cfg: Config):
                 #hp   = F.l1_loss(highpass(Y_pred_tr, 1.5) * M, highpass(Y_true, 1.5) * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
                 #fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
                 # ----- Center-loss application (NEW) -----
-                Hc, Wc = Y_true.shape[-2:]
-                bbox = get_center_bbox(Hc, Wc, cfg)
-                # center crops (transform)
-                Y_pred_tr_c = center_crop(Y_pred_tr, bbox)
-                Y_true_c    = center_crop(Y_true,    bbox)
-                M_c         = center_crop(M,         bbox)
-                # center crops (mm)
-                Y_pred_mm_c = center_crop(Y_pred_mm, bbox)
-                Y_true_mm_c = center_crop(Y_true_mm, bbox)
+                # Hc, Wc = Y_true.shape[-2:]
+                # bbox = get_center_bbox(Hc, Wc, cfg)
+                # # center crops (transform)
+                # Y_pred_tr_c = center_crop(Y_pred_tr, bbox)
+                # Y_true_c    = center_crop(Y_true,    bbox)
+                # M_c         = center_crop(M,         bbox)
+                # # center crops (mm)
+                # Y_pred_mm_c = center_crop(Y_pred_mm, bbox)
+                # Y_true_mm_c = center_crop(Y_true_mm, bbox)
 
-                with torch.autocast(device_type="cuda", enabled=False):
-                    spec = spectral_loss(Y_pred_tr_c * M_c, Y_true_c * M_c).float() * cfg.w_spec if cfg.w_spec > 0 \
-                           else torch.tensor(0., device=device)
+                # with torch.autocast(device_type="cuda", enabled=False):
+                #     spec = spectral_loss(Y_pred_tr_c * M_c, Y_true_c * M_c).float() * cfg.w_spec if cfg.w_spec > 0 \
+                #            else torch.tensor(0., device=device)
 
-                if cfg.loss == "huber":
-                    data_loss = F.smooth_l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
+                # if cfg.loss == "huber":
+                #     data_loss = F.smooth_l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
+                # else:
+                #     data_loss = F.l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
+                # gl   = gradient_loss(Y_pred_tr_c, Y_true_c, mask=M_c) * cfg.w_grad
+                # mass = (
+                #     mass_preservation_penalty(Y_pred_mm_c, Y_true_mm_c, mask=M_c) * cfg.w_mass
+                #     if (cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False))
+                #     else (mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0)
+                # )
+                # hp   = F.l1_loss(highpass(Y_pred_tr_c, 1.5) * M_c, highpass(Y_true_c, 1.5) * M_c) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                # fssl = fss_loss(Y_pred_mm_c, Y_true_mm_c, cfg.fss_thresholds, cfg.fss_window, M_c) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+                # loss = data_loss + gl + spec + mass + hp + fssl
+                # loss = loss + 0.01 * (delta ** 2).mean()
+
+
+
+                # ----- Guided-window loss (replaces center) (NEW / GUIDED) -----
+                p_guided = schedule_linear(global_step, cfg.ramp_start_step, cfg.ramp_end_step,
+                                           float(cfg.p_guided_start), float(cfg.p_guided_end))
+                h_win, w_win = cfg.win_hw
+                use_guided = (torch.rand(1, device=device).item() < p_guided)
+                if use_guided:
+                    interest = build_interest_mm(X, Y_true, Y_pred_tr, cfg)
+                    boxes_k  = select_k_windows(interest, win_hw=cfg.win_hw, K=int(cfg.k_windows),
+                                                margin=int(cfg.margin), keepout_center_px=int(cfg.keepout_center_px),
+                                                jitter=int(cfg.jitter), min_score=float(cfg.min_score),
+                                                suppress_radius=int(cfg.suppress_radius))
                 else:
-                    data_loss = F.l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
-                gl   = gradient_loss(Y_pred_tr_c, Y_true_c, mask=M_c) * cfg.w_grad
-                mass = (
-                    mass_preservation_penalty(Y_pred_mm_c, Y_true_mm_c, mask=M_c) * cfg.w_mass
-                    if (cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False))
-                    else (mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0)
-                )
-                hp   = F.l1_loss(highpass(Y_pred_tr_c, 1.5) * M_c, highpass(Y_true_c, 1.5) * M_c) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-                fssl = fss_loss(Y_pred_mm_c, Y_true_mm_c, cfg.fss_thresholds, cfg.fss_window, M_c) * cfg.w_fss if cfg.w_fss > 0 else 0.0
-                loss = data_loss + gl + spec + mass + hp + fssl
+                    Bb, _, Hc, Wc = Y_true.shape
+                    y0c, x0c = (Hc - h_win)//2, (Wc - w_win)//2
+                    boxes_k = [[(y0c, x0c, y0c + h_win, x0c + w_win)] for _ in range(Bb)]
+
+                per_sample = []
+                for b in range(Y_true.shape[0]):
+                    lb = compute_all_losses_over_boxes(
+                        Y_pred_tr[b:b+1], Y_true[b:b+1], M[b:b+1],
+                        Y_pred_mm[b:b+1], Y_true_mm[b:b+1],
+                        boxes_k[b], cfg, device
+                    )
+                    per_sample.append(lb)
+                loss = torch.stack(per_sample).mean()
+                # add full-field mass if not using box mass
+                if cfg.w_mass > 0 and not getattr(cfg, "center_apply_mass", False):
+                    loss = loss + mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass
                 loss = loss + 0.01 * (delta ** 2).mean()
+
 
                 if cfg.deep_supervision and aux is not None:
                     ds_w = (cfg.ds_weights or [0.2, 0.1])
@@ -2027,6 +2250,9 @@ def train(cfg: Config):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
+
+            # (GUIDED) step curriculum
+            global_step += 1
 
             running += float(loss.detach())
             if is_main and hasattr(steps_iter, "set_postfix") and (step % log_every == 0):
@@ -2118,35 +2344,59 @@ def train(cfg: Config):
                     #    hp = F.l1_loss(hp_pred * M, hp_true * M) * cfg.w_hp if cfg.w_hp > 0 else 0.0
                     #    fssl = fss_loss(Y_pred_mm, Y_true_mm, cfg.fss_thresholds, cfg.fss_window, M) * cfg.w_fss if cfg.w_fss > 0 else 0.0
                         # ----- Center-loss in validation (NEW) -----
-                        Hval, Wval = Y_true.shape[-2:]
-                        bboxv = get_center_bbox(Hval, Wval, cfg)
+                        # Hval, Wval = Y_true.shape[-2:]
+                        # bboxv = get_center_bbox(Hval, Wval, cfg)
 
-                        Y_pred_tr_c = center_crop(Y_pred_tr, bboxv)
-                        Y_true_c    = center_crop(Y_true,    bboxv)
-                        M_c         = center_crop(M,         bboxv)
+                        # Y_pred_tr_c = center_crop(Y_pred_tr, bboxv)
+                        # Y_true_c    = center_crop(Y_true,    bboxv)
+                        # M_c         = center_crop(M,         bboxv)
 
-                        Y_pred_mm_c = center_crop(Y_pred_mm, bboxv)
-                        Y_true_mm_c = center_crop(Y_true_mm, bboxv)
+                        # Y_pred_mm_c = center_crop(Y_pred_mm, bboxv)
+                        # Y_true_mm_c = center_crop(Y_true_mm, bboxv)
 
-                        if cfg.loss == "huber":
-                            data_loss = F.smooth_l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
-                        else:
-                            data_loss = F.l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
+                        # if cfg.loss == "huber":
+                        #     data_loss = F.smooth_l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
+                        # else:
+                        #     data_loss = F.l1_loss(Y_pred_tr_c * M_c, Y_true_c * M_c)
 
-                        gl = gradient_loss(Y_pred_tr_c, Y_true_c, mask=M_c) * cfg.w_grad
+                        # gl = gradient_loss(Y_pred_tr_c, Y_true_c, mask=M_c) * cfg.w_grad
 
-                        spec = spectral_loss(Y_pred_tr_c * M_c, Y_true_c * M_c) * cfg.w_spec if cfg.w_spec > 0 else 0.0
-                        mass = (
-                            mass_preservation_penalty(Y_pred_mm_c, Y_true_mm_c, mask=M_c) * cfg.w_mass
-                            if (cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False))
-                            else (mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0)
-                        )
-                        hp_pred = highpass(Y_pred_tr_c, sigma=1.5)
-                        hp_true = highpass(Y_true_c,    sigma=1.5)
-                        hp = F.l1_loss(hp_pred * M_c, hp_true * M_c) * cfg.w_hp if cfg.w_hp > 0 else 0.0
-                        fssl = fss_loss(Y_pred_mm_c, Y_true_mm_c, cfg.fss_thresholds, cfg.fss_window, M_c) * cfg.w_fss if cfg.w_fss > 0 else 0.0
+                        # spec = spectral_loss(Y_pred_tr_c * M_c, Y_true_c * M_c) * cfg.w_spec if cfg.w_spec > 0 else 0.0
+                        # mass = (
+                        #     mass_preservation_penalty(Y_pred_mm_c, Y_true_mm_c, mask=M_c) * cfg.w_mass
+                        #     if (cfg.w_mass > 0 and getattr(cfg, "center_apply_mass", False))
+                        #     else (mass_preservation_penalty(Y_pred_mm, Y_true_mm, mask=M) * cfg.w_mass if cfg.w_mass > 0 else 0.0)
+                        # )
+                        # hp_pred = highpass(Y_pred_tr_c, sigma=1.5)
+                        # hp_true = highpass(Y_true_c,    sigma=1.5)
+                        # hp = F.l1_loss(hp_pred * M_c, hp_true * M_c) * cfg.w_hp if cfg.w_hp > 0 else 0.0
+                        # fssl = fss_loss(Y_pred_mm_c, Y_true_mm_c, cfg.fss_thresholds, cfg.fss_window, M_c) * cfg.w_fss if cfg.w_fss > 0 else 0.0
 
-                        vloss = data_loss + gl + spec + mass + hp + fssl
+                        # vloss = data_loss + gl + spec + mass + hp + fssl
+
+                        # ----- Guided-window validation loss (NEW / GUIDED) -----
+                        # use deterministic selection by setting jitter=0
+                        orig_mode = cfg.sampling_mode
+                        cfg.sampling_mode = getattr(cfg, "val_sampling_mode", "binary")
+                        with torch.no_grad():
+                            interest_v = build_interest_mm(X, Y_true, Y_pred_tr, cfg)
+                            boxes_k_v  = select_k_windows(
+                                interest_v, win_hw=cfg.win_hw, K=int(cfg.k_windows),
+                                margin=int(cfg.margin), keepout_center_px=int(cfg.keepout_center_px),
+                                jitter=0, min_score=float(cfg.min_score), suppress_radius=int(cfg.suppress_radius)
+                            )
+                        cfg.sampling_mode = orig_mode
+                        per_sample_v = []
+                        for b in range(Y_true.shape[0]):
+                            lv = compute_all_losses_over_boxes(
+                                Y_pred_tr[b:b+1], Y_true[b:b+1], M[b:b+1],
+                                Y_pred_mm[b:b+1], Y_true_mm[b:b+1],
+                                boxes_k_v[b], cfg, device
+                            )
+                            per_sample_v.append(lv)
+                        vloss = torch.stack(per_sample_v).mean()
+                        # keep full-field RMSE/MAE/FSS metrics (unchanged) below
+
                         va_losses.append(float(vloss.detach()))
                         va_rmse.append(rmse(Y_pred_mm, Y_true_mm, mask=M).item())
                         va_mae.append(mae(Y_pred_mm, Y_true_mm, mask=M).item())
@@ -2548,6 +2798,29 @@ def build_arg_parser():
                     help="Also apply mass penalty on center crop (default is full field).")
 
 
+
+    # ---------- Guided selection CLI (NEW / GUIDED) ----------
+    ap.add_argument("--win_hw", type=int, nargs=2, metavar=("H","W"), default=None)
+    ap.add_argument("--sampling_mode", type=str, choices=["binary","continuous","error"], default=None)
+    ap.add_argument("--val_sampling_mode", type=str, choices=["binary","continuous","error"], default=None)
+    ap.add_argument("--k_windows", type=int, default=None)
+    ap.add_argument("--margin", type=int, default=None)
+    ap.add_argument("--keepout_center_px", type=int, default=None)
+    ap.add_argument("--jitter", type=int, default=None)
+    ap.add_argument("--min_score", type=float, default=None)
+    ap.add_argument("--suppress_radius", type=int, default=None)
+    ap.add_argument("--y_thr_mm", type=float, default=None)
+    ap.add_argument("--x_thr_mm", type=float, default=None)
+    ap.add_argument("--d_thr_mm", type=float, default=None)
+    ap.add_argument("--err_p", type=float, default=None)
+    ap.add_argument("--err_w", type=float, default=None)
+    ap.add_argument("--err_pos", type=float, default=None)
+    ap.add_argument("--p_guided_start", type=float, default=None)
+    ap.add_argument("--p_guided_end",   type=float, default=None)
+    ap.add_argument("--ramp_start_step", type=int, default=None)
+    ap.add_argument("--ramp_end_step",   type=int, default=None)
+
+
     ap.add_argument(
         "--biased_policy",
         type=str,
@@ -2634,6 +2907,27 @@ def main():
     if (cfg.center_fraction is not None) and (cfg.center_fraction <= 0):
         cfg.center_fraction = None
 
+
+    # Guided selection CLI bindings (optional)
+    if args.win_hw is not None: cfg.win_hw = tuple(args.win_hw)
+    if args.sampling_mode is not None: cfg.sampling_mode = args.sampling_mode
+    if args.val_sampling_mode is not None: cfg.val_sampling_mode = args.val_sampling_mode
+    if args.k_windows is not None: cfg.k_windows = args.k_windows
+    if args.margin is not None: cfg.margin = args.margin
+    if args.keepout_center_px is not None: cfg.keepout_center_px = args.keepout_center_px
+    if args.jitter is not None: cfg.jitter = args.jitter
+    if args.min_score is not None: cfg.min_score = args.min_score
+    if args.suppress_radius is not None: cfg.suppress_radius = args.suppress_radius
+    if args.y_thr_mm is not None: cfg.y_thr_mm = args.y_thr_mm
+    if args.x_thr_mm is not None: cfg.x_thr_mm = args.x_thr_mm
+    if args.d_thr_mm is not None: cfg.d_thr_mm = args.d_thr_mm
+    if args.err_p is not None: cfg.err_p = args.err_p
+    if args.err_w is not None: cfg.err_w = args.err_w
+    if args.err_pos is not None: cfg.err_pos = args.err_pos
+    if args.p_guided_start is not None: cfg.p_guided_start = args.p_guided_start
+    if args.p_guided_end   is not None: cfg.p_guided_end   = args.p_guided_end
+    if args.ramp_start_step is not None: cfg.ramp_start_step = args.ramp_start_step
+    if args.ramp_end_step   is not None: cfg.ramp_end_step   = args.ramp_end_step
 
     if args.out_dir: cfg.out_dir = args.out_dir
     if args.ckpt_name: cfg.ckpt_name = args.ckpt_name
